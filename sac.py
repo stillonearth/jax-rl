@@ -44,12 +44,9 @@ class Q(nn.Module):
         dtype = jnp.float32
 
         x = jnp.concatenate([x, a], 1)
-
         x = nn.relu(nn.Dense(features=NET_SIZE, name="fc1", dtype=dtype)(x))
         x = nn.relu(nn.Dense(features=NET_SIZE, name="fc2", dtype=dtype)(x))
-        x = nn.relu(nn.Dense(features=NET_SIZE, name="fc3", dtype=dtype)(x))
-        x = nn.relu(nn.Dense(features=NET_SIZE, name="fc4", dtype=dtype)(x))
-        x = nn.Dense(features=1, name="fc5", dtype=dtype)(x)
+        x = nn.Dense(features=1, name="fc_out", dtype=dtype)(x)
 
         return x
 
@@ -65,8 +62,6 @@ class Actor(nn.Module):
 
         x = nn.relu(nn.Dense(features=NET_SIZE, name="fc1", dtype=dtype)(x))
         x = nn.relu(nn.Dense(features=NET_SIZE, name="fc2", dtype=dtype)(x))
-        x = nn.relu(nn.Dense(features=NET_SIZE, name="fc3", dtype=dtype)(x))
-        x = nn.relu(nn.Dense(features=NET_SIZE, name="fc4", dtype=dtype)(x))
         mean = nn.Dense(features=self.action_size, name="fc_mean", dtype=dtype)(x)
         log_std = nn.tanh(
             nn.Dense(features=self.action_size, name="fc_logstd", dtype=dtype)(x)
