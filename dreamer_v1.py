@@ -357,15 +357,6 @@ def dreamer():
 
             # ~~~~~~~~~~~~~~~~~~~
 
-            embedded_next_obs = encoder_nn.apply(encoder_params, next_obs)
-            next_state_prior, next_state_posterior, rnn_hidden = rssm_nn.apply(
-                embedded_obs, actions, rnn_hidden_state, embedded_next_obs
-            )
-            reconstructed_obs = obs_nn.apply(obs_params, embedded_obs, rnn_hidden)
-            reconstructed_reward = reward_nn.apply(
-                reward_params, embedded_obs, rnn_hidden
-            )
-
             # Behavior Learning
             trajectories = imagine_trajectories(
                 trans_params, action_params, representations
