@@ -46,6 +46,7 @@ class Q(nn.Module):
         x = jnp.concatenate([x, a], 1)
         x = nn.relu(nn.Dense(features=NET_SIZE, name="fc1", dtype=dtype)(x))
         x = nn.relu(nn.Dense(features=NET_SIZE, name="fc2", dtype=dtype)(x))
+        # x = nn.relu(nn.Dense(features=NET_SIZE, name="fc3", dtype=dtype)(x))
         x = nn.Dense(features=1, name="fc_out", dtype=dtype)(x)
 
         return x
@@ -200,7 +201,7 @@ def main():
         """Q Loss"""
         loss = q.apply(params, state, action).reshape(-1) - y_target
         loss = jnp.power(loss, 2).mean()
-        return loss
+        return 0.5 * loss
 
     @jax.jit
     @jax.value_and_grad
