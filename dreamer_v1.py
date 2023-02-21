@@ -22,9 +22,9 @@ REPRESENTATION_SIZE = 256
 RNN_SIZE = 128
 STATE_DIM = 128
 
-BATCH_SIZE = 256
-BUFFER_SIZE = 1_000_000
-CHUNK_LENGTH = 50
+BATCH_SIZE = 16
+BUFFER_SIZE = 256
+CHUNK_LENGTH = 3
 ENV_NAME = "BipedalWalker-v3"
 IMAGINATION_HORIZON = 50
 LEARNING_RATE = 3e-4
@@ -46,22 +46,30 @@ class Encoder(nn.Module):
 
     @nn.compact
     def __call__(self, obs: chex.Array):
+
+        # batch_size = obs[0]
+
         hidden = nn.relu(
             nn.Conv(features=32, kernel_size=[4, 4], strides=[2, 2], name="cv1")(obs)
         )
         hidden = nn.relu(
-            nn.Conv(features=64, kernel_size=[4, 4], strides=[2, 2], name="cv2")(obs)
+            nn.Conv(features=64, kernel_size=[4, 4], strides=[2, 2], name="cv2")(hidden)
         )
         hidden = nn.relu(
-            nn.Conv(features=128, kernel_size=[4, 4], strides=[2, 2], name="cv3")(obs)
+            nn.Conv(features=128, kernel_size=[4, 4], strides=[2, 2], name="cv3")(
+                hidden
+            )
         )
         embedded_obs = nn.relu(
-            nn.Conv(features=256, kernel_size=[4, 4], strides=[2, 2], name="cv4")(obs)
-        ).reshape((hidden[0], -1))
+            nn.Conv(features=256, kernel_size=[4, 4], strides=[2, 2], name="cv4")(
+                hidden
+            )
+        )
+
         return embedded_obs
 
 
-class RSSM:
+class RSSM(nn.Module):
     """Joint Prior / Posterion network mimicking the Kalman filter"""
 
     @nn.compact
@@ -88,7 +96,7 @@ class RSSM:
         """
         hidden = nn.relu(
             nn.Dense(features=HIDDEN_DIM, name="fc_state_action")(
-                jnp.cat([state, action], dim=1)
+                jnp.concatenate([state, action], 1)
             )
         )
         rnn_hidden = nn.GRUCell()(hidden, rnn_hidden)
@@ -103,15 +111,16 @@ class RSSM:
             )
             + min_stddev
         )
-        return distrax.Normal(mean, stddev), rnn_hidden
+        return distrax.Normal(mean, stddev), rnn_hidden[0]
 
     def posterior(self, rnn_hidden, embedded_obs, min_stddev=0.1):
         """
         Compute posterior q(s_t | h_t, o_t)
         """
-        hidden = self.act(
+
+        hidden = nn.relu(
             nn.Dense(features=STATE_DIM, name="fc_rnn_hidden_embedded_obs")(
-                jnp.cat([rnn_hidden, embedded_obs], dim=1)
+                jnp.concatenate([rnn_hidden, embedded_obs], 1)
             )
         )
         mean = nn.Dense(features=STATE_DIM, name="fc_state_mean_posterior")(hidden)
@@ -129,7 +138,9 @@ class Observation(nn.Module):
 
     @nn.compact
     def __call__(self, obs: chex.Array, rnn_state: chex.Array):
-        hidden = nn.Dense(features=1024, name="fc")(jnp.cat([obs, rnn_state], dim=1))
+        hidden = nn.Dense(features=1024, name="fc")(
+            jnp.concatenate([obs, rnn_state], 1)
+        )
         hidden = hidden.reshape((hidden.shape[0], 1024, 1, 1))
         hidden = nn.relu(
             nn.ConvTranspose(128, kernel_size=[5, 5], strides=[2, 2], name="dc1")(
@@ -152,7 +163,9 @@ class Reward(nn.Module):
     @nn.compact
     def __call__(self, obs: chex.Array, rnn_state: chex.Array):
         hidden = nn.relu(
-            nn.Dense(features=HIDDEN_DIM, name="fc1")(jnp.cat([obs, rnn_state], dim=1))
+            nn.Dense(features=HIDDEN_DIM, name="fc1")(
+                jnp.concatenate([obs, rnn_state], 1)
+            )
         )
         hidden = nn.relu(nn.Dense(features=HIDDEN_DIM, name="fc2")(hidden))
         hidden = nn.relu(nn.Dense(features=HIDDEN_DIM, name="fc3")(hidden))
@@ -202,6 +215,7 @@ def dreamer():
         gym.make(ENV_NAME, render_mode="rgb_array")
     )
     default_obs, _ = env.reset()
+    pixel_obs_shape = [1] + list(default_obs["pixels"].shape)
 
     random_key = random.PRNGKey(0)
 
@@ -215,7 +229,7 @@ def dreamer():
     random_key, subkey = random.split(random_key)
     encoder_params = encoder_nn.init(
         subkey,
-        initializer(subkey, default_obs["pixels"].shape, jnp.float32),
+        initializer(subkey, pixel_obs_shape, jnp.float32),
     )
 
     rssm_nn = RSSM()
@@ -229,7 +243,7 @@ def dreamer():
     )
     rssm_opt_state = optimizer.init(rssm_params)
 
-    obs_nn = Observation
+    obs_nn = Observation()
     random_key, subkey = random.split(random_key)
     obs_params = obs_nn.init(
         subkey,
@@ -243,6 +257,7 @@ def dreamer():
     reward_params = reward_nn.init(
         subkey,
         initializer(subkey, (1, REPRESENTATION_SIZE), jnp.float32),
+        initializer(subkey, (1, RNN_SIZE), jnp.float32),
     )
     reward_opt_state = optimizer.init(reward_params)
 
@@ -297,7 +312,7 @@ def dreamer():
             state = next_state_posterior.sample()
             states[l + 1] = state
             rnn_hidden_states[l + 1] = rnn_hidden_state
-            kl = kl_divergence(next_state_prior, next_state_posterior).sum(dim=1)
+            kl = kl_divergence(next_state_prior, next_state_posterior).sum(1)
             kl_loss += jax.lax.clamp(kl, min=FREE_NATS).mean()
 
         kl_loss /= CHUNK_LENGTH - 1
@@ -367,16 +382,19 @@ def dreamer():
     for global_step in tqdm(range(TOTAL_TIMESTEPS)):
 
         if global_step < SEED_EPISODES:
-            actions = np.array([env.action_space.sample()])
+            actions = np.array(env.action_space.sample())
         else:
             actions = action_nn.apply(action_params, prev_reps["pixels"])
 
-        next_observations, current_rewards, dones, _, infos = env.step(actions)
+        next_observations, rewards, dones, _, infos = env.step(actions)
         rb.push(current_observations, actions, rewards, dones)
 
         current_observations = next_observations["pixels"]
 
-        if global_step < SEED_EPISODES:
+        # if global_step < SEED_EPISODES:
+        #     continue
+
+        if len(rb) < BATCH_SIZE:
             continue
 
         for _ in range(N_UPDATE_STEPS):
@@ -389,6 +407,12 @@ def dreamer():
             embedded_obs = encoder_nn.apply(encoder_params, observations)
             state = jnp.zeros((BATCH_SIZE, REPRESENTATION_SIZE))
             rnn_hidden_state = jnp.zeros((BATCH_SIZE, RNN_SIZE))
+
+            print()
+            print(state.shape)
+            print(actions.shape)
+
+            exit()
 
             (kl_loss, (states, rnn_hidden_states)), rssm_grad = rssm_loss_and_grad(
                 rssm_params, state, actions, rnn_hidden_state, embedded_obs
@@ -410,6 +434,7 @@ def dreamer():
             writer.add_scalar("loss/observation", np.array(obs_loss), global_step)
             updates, obs_opt_state = optimizer.update(obs_grad, obs_opt_state)
             obs_params = optax.apply_updates(obs_params, updates)
+
             # ~~~~~~~~~~~~~~~~~~~
 
             # Behavior Learning
@@ -478,7 +503,7 @@ class ReplayBuffer(object):
         self.observations = np.zeros((capacity, *observation_shape), dtype=np.uint8)
         self.actions = np.zeros((capacity, action_dim), dtype=np.float32)
         self.rewards = np.zeros((capacity, 1), dtype=np.float32)
-        self.done = np.zeros((capacity, 1), dtype=np.bool)
+        self.done = np.zeros((capacity, 1), dtype=np.bool8)
 
         self.index = 0
         self.is_filled = False

@@ -17,10 +17,26 @@ A jax port of clean-rl SAC.
 - Implementation: [sac.py](./sac.py)
 - Usage: `python sac.py`
 
-## Notes
+### JAX Environmental Variables
 
 JAX would try to preallocate too much memory on GPU, so you need to set this env variable:
 
 ```bash
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
+```
+
+## Dreamer
+
+A one-file mini implementation of [Dreamer (v1)](https://arxiv.org/pdf/1912.01603.pdf) algorithm in JAX.
+
+### Implementations
+
+- Implementation: [dreamer_v1.py](./sac.py)
+- Usage: `python dreamer_v1.py`
+
+### JAX Environmental Variables
+
+```bash
+export XLA_FLAGS=--xla_gpu_strict_conv_algorithm_picker=false
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.95
 ```
