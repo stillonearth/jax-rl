@@ -29,6 +29,8 @@ export XLA_PYTHON_CLIENT_PREALLOCATE=false
 
 A one-file mini implementation of [Dreamer (v1)](https://arxiv.org/pdf/1912.01603.pdf) algorithm in JAX.
 
+![dreamer v1](https://user-images.githubusercontent.com/97428129/220439512-d2ce48cb-09cc-439f-b502-10ac1fba370a.png)
+
 ### Implementations
 
 - Implementation: [dreamer_v1.py](./sac.py)
