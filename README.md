@@ -35,10 +35,3 @@ A one-file mini implementation of [Dreamer (v1)](https://arxiv.org/pdf/1912.0160
 
 - Implementation: [dreamer_v1.py](./sac.py)
 - Usage: `python dreamer_v1.py`
-
-### JAX Environmental Variables
-
-```bash
-export XLA_FLAGS=--xla_gpu_strict_conv_algorithm_picker=false
-export XLA_PYTHON_CLIENT_MEM_FRACTION=0.95
-```

@@ -76,6 +76,7 @@ gym-notices=0.0.8=pypi_0
 gymnasium=0.27.1=pypi_0
 gymnasium-notices=0.0.1=pypi_0
 idna=3.4=pyhd8ed1ab_0
+importlib-metadata=4.13.0=pypi_0
 importlib-resources=5.12.0=pypi_0
 jax=0.4.4=pyhd8ed1ab_0
 jax-jumpy=0.2.0=pypi_0
@@ -141,6 +142,7 @@ opt_einsum=3.3.0=pyhd8ed1ab_1
 optax=0.1.4=pypi_0
 orbax=0.1.2=pypi_0
 packaging=23.0=pyhd8ed1ab_0
+pandas=1.5.3=pypi_0
 pillow=9.4.0=pypi_0
 pip=23.0.1=pyhd8ed1ab_0
 pooch=1.6.0=pyhd8ed1ab_0
@@ -156,6 +158,7 @@ pysocks=1.7.1=pyha2e5f31_6
 python=3.11.0=he550d4f_1_cpython
 python-dateutil=2.8.2=pypi_0
 python_abi=3.11=3_cp311
+pytz=2022.7.1=pypi_0
 pyyaml=6.0=pypi_0
 re2=2023.02.01=hcb278e6_0
 readline=8.1.2=h0f457ee_0
@@ -166,6 +169,7 @@ rsa=4.9=pypi_0
 scipy=1.10.0=py311h8e6699e_2
 setuptools=67.3.2=pyhd8ed1ab_0
 six=1.16.0=pypi_0
+git+https://github.com/stillonearth/stable-baselines3.git
 swig=4.1.1=pypi_0
 tensorboard=2.12.0=pypi_0
 tensorboard-data-server=0.7.0=pypi_0
@@ -182,4 +186,5 @@ urllib3=1.26.14=pyhd8ed1ab_0
 werkzeug=2.2.3=pypi_0
 wheel=0.38.4=pyhd8ed1ab_0
 xz=5.2.6=h166bdaf_0
+zipp=3.14.0=pypi_0
 zlib=1.2.13=h166bdaf_4

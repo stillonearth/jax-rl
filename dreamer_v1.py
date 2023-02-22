@@ -411,6 +411,7 @@ def dreamer():
             print()
             print(state.shape)
             print(actions.shape)
+            print(observations.shape)
 
             exit()
 
