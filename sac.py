@@ -16,7 +16,6 @@ from flax import linen as nn
 from torch.utils.tensorboard import SummaryWriter
 
 
-ALPHA = 0.2
 BATCH_SIZE = 256
 BUFFER_SIZE = 1_000_000
 ENV_NAME = "BipedalWalker-v3"

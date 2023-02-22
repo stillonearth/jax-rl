@@ -19,7 +19,7 @@ A jax port of clean-rl SAC.
 
 ### JAX Environmental Variables
 
-JAX would try to preallocate too much memory on GPU, so you need to set this env variable:
+JAX might try to preallocate too much memory on GPU, so you need to set this env variable:
 
 ```bash
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
@@ -30,6 +30,16 @@ export XLA_PYTHON_CLIENT_PREALLOCATE=false
 A one-file mini implementation of [Dreamer (v1)](https://arxiv.org/pdf/1912.01603.pdf) algorithm in JAX.
 
 ![dreamer v1](https://user-images.githubusercontent.com/97428129/220439512-d2ce48cb-09cc-439f-b502-10ac1fba370a.png)
+
+### JAX Environmental Variables
+
+Depending on JAX version and system configuration these variables might be needed.
+
+```bash
+export XLA_FLAGS=--xla_gpu_strict_conv_algorithm_picker=false
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.97
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+```
 
 ### Implementations
 

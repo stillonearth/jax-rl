@@ -6,21 +6,19 @@ import distrax
 import chex
 import gymnasium as gym
 
-from typing import *
-
-# from stable_baselines3.common.buffers import ReplayBuffer
-from tqdm import tqdm
-
 from jax import random
 from flax import linen as nn
 
+from typing import *
+from tqdm import tqdm
+from skimage.transform import resize
 from torch.utils.tensorboard import SummaryWriter
 
 
 HIDDEN_DIM = 256
-REPRESENTATION_SIZE = 256
 RNN_SIZE = 128
 STATE_DIM = 128
+PIXEL_OBS_SHAPE = (1, 40, 40, 3)
 
 BATCH_SIZE = 16
 BUFFER_SIZE = 256
@@ -33,7 +31,7 @@ N_UPDATE_STEPS = 1
 SEED_EPISODES = 5e3
 SEQUENCE_LENGTH = 50
 TOTAL_TIMESTEPS = 1_000_000
-FREE_NATS = 3
+FREE_NATS = 3.0
 DISCOUNT = 0.2
 
 
@@ -46,9 +44,6 @@ class Encoder(nn.Module):
 
     @nn.compact
     def __call__(self, obs: chex.Array):
-
-        # batch_size = obs[0]
-
         hidden = nn.relu(
             nn.Conv(features=32, kernel_size=[4, 4], strides=[2, 2], name="cv1")(obs)
         )
@@ -60,13 +55,11 @@ class Encoder(nn.Module):
                 hidden
             )
         )
-        embedded_obs = nn.relu(
+        return nn.relu(
             nn.Conv(features=256, kernel_size=[4, 4], strides=[2, 2], name="cv4")(
                 hidden
             )
         )
-
-        return embedded_obs
 
 
 class RSSM(nn.Module):
@@ -96,10 +89,11 @@ class RSSM(nn.Module):
         """
         hidden = nn.relu(
             nn.Dense(features=HIDDEN_DIM, name="fc_state_action")(
-                jnp.concatenate([state, action], 1)
+                jnp.concatenate([state, action], -1)
             )
         )
-        rnn_hidden = nn.GRUCell()(hidden, rnn_hidden)
+        rnn_hidden, _ = nn.GRUCell()(rnn_hidden, hidden)
+
         hidden = nn.relu(
             nn.Dense(features=HIDDEN_DIM, name="fc_rnn_hidden")(rnn_hidden)
         )
@@ -111,7 +105,7 @@ class RSSM(nn.Module):
             )
             + min_stddev
         )
-        return distrax.Normal(mean, stddev), rnn_hidden[0]
+        return distrax.Normal(mean, stddev), rnn_hidden
 
     def posterior(self, rnn_hidden, embedded_obs, min_stddev=0.1):
         """
@@ -120,7 +114,7 @@ class RSSM(nn.Module):
 
         hidden = nn.relu(
             nn.Dense(features=STATE_DIM, name="fc_rnn_hidden_embedded_obs")(
-                jnp.concatenate([rnn_hidden, embedded_obs], 1)
+                jnp.concatenate([rnn_hidden, embedded_obs], -1)
             )
         )
         mean = nn.Dense(features=STATE_DIM, name="fc_state_mean_posterior")(hidden)
@@ -139,11 +133,11 @@ class Observation(nn.Module):
     @nn.compact
     def __call__(self, obs: chex.Array, rnn_state: chex.Array):
         hidden = nn.Dense(features=1024, name="fc")(
-            jnp.concatenate([obs, rnn_state], 1)
+            jnp.concatenate([obs, rnn_state], -1)
         )
-        hidden = hidden.reshape((hidden.shape[0], 1024, 1, 1))
+        hidden = hidden.reshape((-1, 1, 1, 1024))
         hidden = nn.relu(
-            nn.ConvTranspose(128, kernel_size=[5, 5], strides=[2, 2], name="dc1")(
+            nn.ConvTranspose(128, kernel_size=[2, 2], strides=[5, 5], name="dc1")(
                 hidden
             )
         )
@@ -162,15 +156,11 @@ class Observation(nn.Module):
 class Reward(nn.Module):
     @nn.compact
     def __call__(self, obs: chex.Array, rnn_state: chex.Array):
-        hidden = nn.relu(
-            nn.Dense(features=HIDDEN_DIM, name="fc1")(
-                jnp.concatenate([obs, rnn_state], 1)
-            )
-        )
-        hidden = nn.relu(nn.Dense(features=HIDDEN_DIM, name="fc2")(hidden))
-        hidden = nn.relu(nn.Dense(features=HIDDEN_DIM, name="fc3")(hidden))
-        reward = nn.Dense(features=1, name="fc4")(hidden)
-        return reward
+        x = jnp.concatenate([obs, rnn_state], -1)
+        x = nn.relu(nn.Dense(features=HIDDEN_DIM, name="fc1")(x))
+        x = nn.relu(nn.Dense(features=HIDDEN_DIM, name="fc2")(x))
+        x = nn.relu(nn.Dense(features=HIDDEN_DIM, name="fc3")(x))
+        return nn.Dense(features=1, name="fc4")(x)
 
 
 class Action(nn.Module):
@@ -184,7 +174,7 @@ class Action(nn.Module):
 
         x = s
 
-        x = jnp.concatenate([s], 1)
+        x = jnp.concatenate([s], -1)
         x = nn.relu(nn.Dense(features=HIDDEN_DIM, name="fc1", dtype=dtype)(x))
         x = nn.relu(nn.Dense(features=HIDDEN_DIM, name="fc2", dtype=dtype)(x))
         x = nn.Dense(features=self.action_size, name="fc_out", dtype=dtype)(x)
@@ -201,7 +191,7 @@ class Value(nn.Module):
 
         x = s
 
-        x = jnp.concatenate([s], 1)
+        x = jnp.concatenate([s], -1)
         x = nn.relu(nn.Dense(features=HIDDEN_DIM, name="fc1", dtype=dtype)(x))
         x = nn.relu(nn.Dense(features=HIDDEN_DIM, name="fc2", dtype=dtype)(x))
         x = nn.Dense(features=1, name="fc_out", dtype=dtype)(x)
@@ -214,8 +204,6 @@ def dreamer():
     env = gym.wrappers.PixelObservationWrapper(
         gym.make(ENV_NAME, render_mode="rgb_array")
     )
-    default_obs, _ = env.reset()
-    pixel_obs_shape = [1] + list(default_obs["pixels"].shape)
 
     random_key = random.PRNGKey(0)
 
@@ -229,17 +217,21 @@ def dreamer():
     random_key, subkey = random.split(random_key)
     encoder_params = encoder_nn.init(
         subkey,
-        initializer(subkey, pixel_obs_shape, jnp.float32),
+        initializer(subkey, PIXEL_OBS_SHAPE, jnp.float32),
     )
+
+    sample_encoded = encoder_nn.apply(
+        encoder_params, jnp.zeros(PIXEL_OBS_SHAPE)
+    ).reshape(1, -1)
 
     rssm_nn = RSSM()
     random_key, subkey = random.split(random_key)
     rssm_params = rssm_nn.init(
         subkey,
-        initializer(subkey, (1, REPRESENTATION_SIZE), jnp.float32),
+        initializer(subkey, (1, STATE_DIM), jnp.float32),
         initializer(subkey, (1, env.action_space.shape[0]), jnp.float32),
         initializer(subkey, (1, RNN_SIZE), jnp.float32),
-        initializer(subkey, (1, RNN_SIZE + 1024), jnp.float32),
+        sample_encoded,
     )
     rssm_opt_state = optimizer.init(rssm_params)
 
@@ -247,7 +239,7 @@ def dreamer():
     random_key, subkey = random.split(random_key)
     obs_params = obs_nn.init(
         subkey,
-        initializer(subkey, (1, REPRESENTATION_SIZE), jnp.float32),
+        initializer(subkey, (1, STATE_DIM), jnp.float32),
         initializer(subkey, (1, RNN_SIZE), jnp.float32),
     )
     obs_opt_state = optimizer.init(obs_params)
@@ -256,7 +248,7 @@ def dreamer():
     random_key, subkey = random.split(random_key)
     reward_params = reward_nn.init(
         subkey,
-        initializer(subkey, (1, REPRESENTATION_SIZE), jnp.float32),
+        initializer(subkey, (1, STATE_DIM), jnp.float32),
         initializer(subkey, (1, RNN_SIZE), jnp.float32),
     )
     reward_opt_state = optimizer.init(reward_params)
@@ -265,7 +257,7 @@ def dreamer():
     random_key, subkey = random.split(random_key)
     action_params = action_nn.init(
         subkey,
-        initializer(subkey, (1, REPRESENTATION_SIZE), jnp.float32),
+        initializer(subkey, (1, STATE_DIM), jnp.float32),
     )
     action_opt_state = optimizer.init(action_params)
 
@@ -273,47 +265,54 @@ def dreamer():
     random_key, subkey = random.split(random_key)
     value_params = value_nn.init(
         subkey,
-        initializer(subkey, (1, REPRESENTATION_SIZE), jnp.float32),
+        initializer(subkey, (1, STATE_DIM), jnp.float32),
     )
     value_opt_state = optimizer.init(value_params)
 
-    rb = ReplayBuffer(
-        BUFFER_SIZE, default_obs["pixels"].shape, env.action_space.shape[0]
-    )
+    rb = ReplayBuffer(BUFFER_SIZE, PIXEL_OBS_SHAPE[1:], env.action_space.shape[0])
 
     @jax.jit
     @jax.value_and_grad
     def reward_loss_and_grad(params, states, rnn_hidden_states, rewards):
         predicted_rewards = reward_nn.apply(params, states, rnn_hidden_states)
         reward_loss = (
-            0.5 * (predicted_rewards[1:] - rewards[1:]).pow(2).sum(dim=2).mean()
+            0.5 * jnp.power(predicted_rewards[1:] - rewards[1:], 2).sum(2).mean()
         )
         return reward_loss
 
     @jax.jit
     @jax.value_and_grad
     def reconstruction_loss_and_grad(params, states, rnn_hidden_states, observations):
-        reconstructed_obs = obs_nn.apply(params, states, rnn_hidden_states)
+        reconstructed_obs = obs_nn.apply(params, states, rnn_hidden_states).reshape(
+            (CHUNK_LENGTH, BATCH_SIZE, PIXEL_OBS_SHAPE[1], PIXEL_OBS_SHAPE[2], 3)
+        )
+
         obs_loss = (
-            0.5 * (reconstructed_obs[1:] - observations[1:]).pow(2).sum(dim=2).mean()
+            0.5 * jnp.power(reconstructed_obs[1:] - observations[1:], 2).sum(2).mean()
         )
         return obs_loss
 
     @jax.jit
-    def rssm_loss(params, state, actions, rnn_hidden_state, embedded_obs):
+    def rssm_loss(params, embedded_obs: chex.Array, actions: chex.Array, random_key):
         # from https://github.com/cross32768/PlaNet_PyTorch/blob/master/train.py
-        kl_loss = 0
-        states = jnp.zeros((CHUNK_LENGTH, BATCH_SIZE, REPRESENTATION_SIZE))
+        state = jnp.zeros((BATCH_SIZE, STATE_DIM))
+        states = jnp.zeros((CHUNK_LENGTH, BATCH_SIZE, STATE_DIM))
+        rnn_hidden_state = jnp.zeros((BATCH_SIZE, RNN_SIZE))
         rnn_hidden_states = jnp.zeros((CHUNK_LENGTH, BATCH_SIZE, RNN_SIZE))
+
+        kl_loss = 0
         for l in range(CHUNK_LENGTH - 1):
+
+            random_key, subkey = random.split(random_key)
+
             (next_state_prior, next_state_posterior, rnn_hidden_state,) = rssm_nn.apply(
                 params, state, actions[l], rnn_hidden_state, embedded_obs[l + 1]
             )
-            state = next_state_posterior.sample()
-            states[l + 1] = state
-            rnn_hidden_states[l + 1] = rnn_hidden_state
-            kl = kl_divergence(next_state_prior, next_state_posterior).sum(1)
-            kl_loss += jax.lax.clamp(kl, min=FREE_NATS).mean()
+            state = next_state_posterior.sample(seed=subkey)
+            states = states.at[l + 1].set(state)
+            rnn_hidden_states = rnn_hidden_states.at[l + 1].set(rnn_hidden_state)
+            kl = next_state_prior.kl_divergence(next_state_posterior).sum(1)
+            kl_loss += kl.mean()  # jax.lax.clamp(kl, min=FREE_NATS).mean()
 
         kl_loss /= CHUNK_LENGTH - 1
         return kl_loss, (states, rnn_hidden_states)
@@ -377,19 +376,23 @@ def dreamer():
         return V_lambda
 
     prev_reps, _ = env.reset()
-    current_observations = np.zeros_like(default_obs["pixels"].shape)
+    current_observations = np.zeros_like(PIXEL_OBS_SHAPE[1:])
 
     for global_step in tqdm(range(TOTAL_TIMESTEPS)):
 
         if global_step < SEED_EPISODES:
             actions = np.array(env.action_space.sample())
         else:
-            actions = action_nn.apply(action_params, prev_reps["pixels"])
+            pass
+            # TODO: Implement
+            # actions = action_nn.apply(action_params, prev_reps["pixels"])
 
         next_observations, rewards, dones, _, infos = env.step(actions)
         rb.push(current_observations, actions, rewards, dones)
 
-        current_observations = next_observations["pixels"]
+        current_observations = resize(
+            next_observations["pixels"], (PIXEL_OBS_SHAPE[1], PIXEL_OBS_SHAPE[2])
+        )
 
         # if global_step < SEED_EPISODES:
         #     continue
@@ -400,23 +403,23 @@ def dreamer():
         for _ in range(N_UPDATE_STEPS):
             observations, actions, rewards, _ = rb.sample(BATCH_SIZE, CHUNK_LENGTH)
 
+            # Adjust dimensions to match (chuck_size, batch_size, ...) pattern
+            observations = preprocess_obs(observations)
+            observations = jnp.transpose(observations, (1, 0, 2, 3, 4))
+            actions = jnp.transpose(actions, (1, 0, 2))
+            rewards = jnp.transpose(rewards, (1, 0, 2))
+
             # Dynamics Learning
             # ~~~~~~~~~~~~~~~~~~~
             # In original paper these parameters are shared with the RSSM
             # Here for simplicity they are separate networks
-            embedded_obs = encoder_nn.apply(encoder_params, observations)
-            state = jnp.zeros((BATCH_SIZE, REPRESENTATION_SIZE))
-            rnn_hidden_state = jnp.zeros((BATCH_SIZE, RNN_SIZE))
+            embedded_obs = encoder_nn.apply(encoder_params, observations).reshape(
+                CHUNK_LENGTH, BATCH_SIZE, -1
+            )
 
-            print()
-            print(state.shape)
-            print(actions.shape)
-            print(observations.shape)
-
-            exit()
-
+            random_key, subkey = random.split(random_key)
             (kl_loss, (states, rnn_hidden_states)), rssm_grad = rssm_loss_and_grad(
-                rssm_params, state, actions, rnn_hidden_state, embedded_obs
+                rssm_params, embedded_obs, actions, subkey
             )
             writer.add_scalar("loss/rssm_kl", np.array(kl_loss), global_step)
             updates, rssm_opt_state = optimizer.update(rssm_grad, rssm_opt_state)
@@ -435,6 +438,15 @@ def dreamer():
             writer.add_scalar("loss/observation", np.array(obs_loss), global_step)
             updates, obs_opt_state = optimizer.update(obs_grad, obs_opt_state)
             obs_params = optax.apply_updates(obs_params, updates)
+
+            # print(
+            #     "Losses",
+            #     {
+            #         "kl_loss": np.array(kl_loss),
+            #         "reward": np.array(reward_loss),
+            #         "observation": np.array(obs_loss),
+            #     },
+            # )
 
             # ~~~~~~~~~~~~~~~~~~~
 
@@ -475,10 +487,6 @@ def dreamer():
         #     prev_actions = cur_actions
 
 
-def kl_divergence(mean, logvar):
-    return -0.5 * jnp.sum(1 + logvar - jnp.power(mean, 2) - jnp.exp(logvar))
-
-
 def preprocess_obs(obs, bit_depth=5):
     """
     Reduces the bit depth of image for the ease of training
@@ -504,7 +512,7 @@ class ReplayBuffer(object):
         self.observations = np.zeros((capacity, *observation_shape), dtype=np.uint8)
         self.actions = np.zeros((capacity, action_dim), dtype=np.float32)
         self.rewards = np.zeros((capacity, 1), dtype=np.float32)
-        self.done = np.zeros((capacity, 1), dtype=np.bool8)
+        self.done = np.zeros((capacity, 1), dtype=np.bool_)
 
         self.index = 0
         self.is_filled = False
