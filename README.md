@@ -4,10 +4,6 @@ A verifiable implementation of some RL algorithms in JAX.
 
 Inspired by [CleanRL](https://github.com/vwxyzjn/cleanrl) by [@vwxyzjn](https://github.com/vwxyzjn).
 
-Jax is better than pytorch in terms of performance, but it is not as easy to use as pytorch. This repo is an attempt to make it easier to use.
-
-**This is work in progress**
-
 ## Soft-Actor-Critic
 
 A jax port of clean-rl SAC.
