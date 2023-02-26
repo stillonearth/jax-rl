@@ -1,4 +1,4 @@
-# MiniJAXRL
+# jax-rl
 
 A verifiable implementation of some RL algorithms in JAX.
 
