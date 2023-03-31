@@ -19,7 +19,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 HIDDEN_DIM = 200
 RNN_SIZE = 200
-STATE_DIM = 30
+STATE_DIM = 64
 PIXEL_OBS_SHAPE = (1, 64, 64, 3)
 
 BATCH_SIZE = 50
@@ -243,6 +243,8 @@ def dreamer():
         rnn_hidden_states = jnp.zeros((CHUNK_LENGTH, BATCH_SIZE, RNN_SIZE))
 
         kl_loss = 0.0
+        reconstruction_loss = 0.0
+        reward_loss = 0.0
 
         for l in range(CHUNK_LENGTH - 1):
             random_key, subkey = random.split(random_key)
@@ -271,13 +273,14 @@ def dreamer():
             kl = next_state_posterior.kl_divergence(next_state_prior)
             kl_loss += jax.lax.clamp(x=kl, min=3.0, max=1e6).mean()
 
-            reconstruction_loss = (
+            reconstruction_loss += (
                 0.5
                 * jnp.power(reconstructed_observation - observations[l + 1], 2)
                 .mean([0, 1])
                 .sum()
             )
-            reward_loss = (
+
+            reward_loss += (
                 0.5
                 * jnp.power(reconstructed_rewards - rewards[l + 1], 2)
                 .mean([0, 1])
