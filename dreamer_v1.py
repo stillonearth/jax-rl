@@ -17,24 +17,25 @@ from skimage.transform import resize
 from torch.utils.tensorboard import SummaryWriter
 
 
-HIDDEN_DIM = 256
-RNN_SIZE = 128
-STATE_DIM = 128
+HIDDEN_DIM = 200
+RNN_SIZE = 200
+STATE_DIM = 30
 PIXEL_OBS_SHAPE = (1, 64, 64, 3)
 
-BATCH_SIZE = 64
-BUFFER_SIZE = 10_000
-CHUNK_LENGTH = 16
-ENV_NAME = "BipedalWalker-v3"
-IMAGINATION_HORIZON = 50
-LEARNING_RATE = 3e-4
+BATCH_SIZE = 50
+BUFFER_SIZE = 1_000_000
+CHUNK_LENGTH = 10
+ENV_NAME = "HalfCheetah-v4"
+IMAGINATION_HORIZON = 12
+LEARNING_RATE = 1e-3
 N_INTERACTION_STEPS = 1
-N_UPDATE_STEPS = 2
-SEED_EPISODES = 5e3
+N_UPDATE_STEPS = 1
+SEED_EPISODES = 1_000_000_000
 SEQUENCE_LENGTH = 50
-TOTAL_TIMESTEPS = 1_000_000
+TOTAL_TIMESTEPS = 1_000_000_000
 FREE_NATS = 3.0
 DISCOUNT = 0.2
+MAX_EPISODE_LENGTH = 100
 
 
 # Encoder, Recurrent state space, Observation and Reward models adapted from
@@ -45,23 +46,52 @@ class Encoder(nn.Module):
     """A standard Convolution Network for image observations"""
 
     @nn.compact
-    def __call__(self, obs: chex.Array):
-        hidden = nn.relu(
-            nn.Conv(features=32, kernel_size=[4, 4], strides=[2, 2], name="cv1")(obs)
-        )
-        hidden = nn.relu(
-            nn.Conv(features=64, kernel_size=[4, 4], strides=[2, 2], name="cv2")(hidden)
-        )
-        hidden = nn.relu(
-            nn.Conv(features=128, kernel_size=[4, 4], strides=[2, 2], name="cv3")(
-                hidden
+    def __call__(self, observation: chex.Array):
+        x = nn.relu(
+            nn.Conv(features=32, kernel_size=[4, 4], strides=[2, 2], name="cv1")(
+                observation
             )
+        )
+        x = nn.relu(
+            nn.Conv(features=64, kernel_size=[4, 4], strides=[2, 2], name="cv2")(x)
+        )
+        x = nn.relu(
+            nn.Conv(features=128, kernel_size=[4, 4], strides=[2, 2], name="cv3")(x)
         )
         return nn.relu(
-            nn.Conv(features=256, kernel_size=[4, 4], strides=[2, 2], name="cv4")(
-                hidden
-            )
+            nn.Conv(features=256, kernel_size=[4, 4], strides=[2, 2], name="cv4")(x)
         )
+
+
+class Decoder(nn.Module):
+    """Image reconstruction model"""
+
+    @nn.compact
+    def __call__(self, obs: chex.Array, rnn_state: chex.Array):
+        hidden = nn.Dense(features=1024, name="fc")(
+            jnp.concatenate([obs, rnn_state], -1)
+        )
+        hidden = hidden.reshape((-1, 1, 1, 1024))
+        hidden = nn.relu(
+            nn.ConvTranspose(
+                128, padding="VALID", kernel_size=[5, 5], strides=[2, 2], name="cv1"
+            )(hidden)
+        )
+        hidden = nn.relu(
+            nn.ConvTranspose(
+                64, padding="VALID", kernel_size=[5, 5], strides=[2, 2], name="cv2"
+            )(hidden)
+        )
+        hidden = nn.relu(
+            nn.ConvTranspose(
+                32, padding="VALID", kernel_size=[6, 6], strides=[2, 2], name="cv3"
+            )(hidden)
+        )
+        obs = nn.ConvTranspose(
+            3, padding="VALID", kernel_size=[6, 6], strides=[2, 2], name="cv4"
+        )(hidden)
+
+        return obs
 
 
 class RSSM(nn.Module):
@@ -73,15 +103,16 @@ class RSSM(nn.Module):
         state: chex.Array,
         action: chex.Array,
         rnn_hidden: chex.Array,
-        next_state: chex.Array,
+        next_state_encoded: chex.Array,
     ) -> Tuple[distrax.Normal, chex.Array]:
         """
         h_t+1 = f(s_t, a_t, h_t)
         Return prior p(s_t+1 | h_t+1) and posterior p(s_t+1 | h_t+1, o_t+1)
         for model training
         """
+        # next_state_encoded = Encoder()(observation).reshape((observation.shape[0], -1))
         next_state_prior, rnn_hidden = self.prior(state, action, rnn_hidden)
-        next_state_posterior = self.posterior(rnn_hidden, next_state)
+        next_state_posterior = self.posterior(rnn_hidden, next_state_encoded)
         return next_state_prior, next_state_posterior, rnn_hidden
 
     def prior(self, state, action, rnn_hidden, min_stddev=0.1):
@@ -89,22 +120,19 @@ class RSSM(nn.Module):
         h_t+1 = f(h_t, s_t, a_t)
         Compute prior p(s_t+1 | h_t+1)
         """
-        hidden = nn.relu(
-            nn.Dense(features=HIDDEN_DIM, name="fc_state_action")(
-                jnp.concatenate([state, action], -1)
-            )
-        )
-        rnn_hidden, hidden = nn.GRUCell()(rnn_hidden, hidden)
-        hidden = nn.relu(
-            nn.Dense(features=HIDDEN_DIM, name="fc_rnn_hidden")(rnn_hidden)
-        )
-        mean = nn.Dense(features=STATE_DIM, name="fc_state_mean_prior")(hidden)
+        x = jnp.concatenate([state, action], -1)
+        x = nn.relu(nn.Dense(features=HIDDEN_DIM, name="fc_state_action")(x))
+        rnn_hidden, x = nn.GRUCell()(rnn_hidden, x)
+        x = nn.relu(nn.Dense(features=HIDDEN_DIM, name="fc_rnn_hidden")(rnn_hidden))
+
+        mean = nn.Dense(features=STATE_DIM, name="fc_state_mean_prior")(x)
         stddev = (
             nn.activation.softplus(
-                nn.Dense(features=STATE_DIM, name="fc_state_stddev_prior")(hidden)
+                nn.Dense(features=STATE_DIM, name="fc_state_stddev_prior")(x)
             )
             + min_stddev
         )
+
         return distrax.Normal(mean, stddev), rnn_hidden
 
     def posterior(self, rnn_hidden, embedded_obs, min_stddev=0.1):
@@ -112,50 +140,16 @@ class RSSM(nn.Module):
         Compute posterior q(s_t | h_t, o_t)
         """
 
-        hidden = nn.relu(
-            nn.Dense(features=STATE_DIM, name="fc_rnn_hidden_embedded_obs")(
-                jnp.concatenate([rnn_hidden, embedded_obs], -1)
-            )
-        )
-        mean = nn.Dense(features=STATE_DIM, name="fc_state_mean_posterior")(hidden)
+        x = jnp.concatenate([rnn_hidden, embedded_obs], -1)
+        x = nn.relu(nn.Dense(features=STATE_DIM, name="fc_rnn_hidden_embedded_obs")(x))
+        mean = nn.Dense(features=STATE_DIM, name="fc_state_mean_posterior")(x)
         stddev = (
             nn.activation.softplus(
-                nn.Dense(features=STATE_DIM, name="fc_state_stddev_posterior")(hidden)
+                nn.Dense(features=STATE_DIM, name="fc_state_stddev_posterior")(x)
             )
             + min_stddev
         )
         return distrax.Normal(mean, stddev)
-
-
-class Observation(nn.Module):
-    """Image reconstruction model"""
-
-    @nn.compact
-    def __call__(self, obs: chex.Array, rnn_state: chex.Array):
-        hidden = nn.Dense(features=1024, name="fc")(
-            jnp.concatenate([obs, rnn_state], -1)
-        )
-        hidden = hidden.reshape((-1, 1, 1, 1024))
-        hidden = nn.relu(
-            nn.ConvTranspose(
-                128, padding="VALID", kernel_size=[5, 5], strides=[2, 2], name="dc1"
-            )(hidden)
-        )
-        hidden = nn.relu(
-            nn.ConvTranspose(
-                64, padding="VALID", kernel_size=[5, 5], strides=[2, 2], name="dc2"
-            )(hidden)
-        )
-        hidden = nn.relu(
-            nn.ConvTranspose(
-                32, padding="VALID", kernel_size=[6, 6], strides=[2, 2], name="dc3"
-            )(hidden)
-        )
-        obs = nn.ConvTranspose(
-            3, padding="VALID", kernel_size=[6, 6], strides=[2, 2], name="dc4"
-        )(hidden)
-
-        return obs
 
 
 class Reward(nn.Module):
@@ -166,6 +160,39 @@ class Reward(nn.Module):
         x = nn.relu(nn.Dense(features=HIDDEN_DIM, name="fc2")(x))
         x = nn.relu(nn.Dense(features=HIDDEN_DIM, name="fc3")(x))
         return nn.Dense(features=1, name="fc4")(x)
+
+
+class JointModel(nn.Module):
+    @nn.compact
+    def __call__(
+        self,
+        observations: chex.Array,
+        states: chex.Array,
+        actions: chex.Array,
+        rnn_hidden: chex.Array,
+        random_key,
+    ):
+
+        batch_size = observations.shape[0]
+
+        next_state_encoded = Encoder()(observations).reshape(batch_size, -1)
+
+        next_state_prior, next_state_posterior, rnn_hidden = RSSM()(
+            states, actions, rnn_hidden, next_state_encoded
+        )
+
+        next_state_sample = next_state_posterior.sample(seed=random_key)
+        reconstructed_reward = Reward()(next_state_sample, rnn_hidden)
+        reconstructed_observation = Decoder()(next_state_sample, rnn_hidden)
+
+        return (
+            next_state_prior,
+            next_state_posterior,
+            next_state_sample,
+            rnn_hidden,
+            reconstructed_reward,
+            reconstructed_observation,
+        )
 
 
 def dreamer():
@@ -182,98 +209,135 @@ def dreamer():
     # Neural Networks
     initializer = jax.nn.initializers.xavier_uniform()
 
-    encoder_nn = Encoder()
+    joint_nn = JointModel()
     random_key, subkey = random.split(random_key)
-    encoder_params = encoder_nn.init(
+    joint_params = joint_nn.init(
         subkey,
         initializer(subkey, PIXEL_OBS_SHAPE, jnp.float32),
-    )
-
-    sample_encoded = encoder_nn.apply(
-        encoder_params, jnp.zeros(PIXEL_OBS_SHAPE)
-    ).reshape(1, -1)
-
-    rssm_nn = RSSM()
-    random_key, subkey = random.split(random_key)
-    rssm_params = rssm_nn.init(
-        subkey,
         initializer(subkey, (1, STATE_DIM), jnp.float32),
         initializer(subkey, (1, env.action_space.shape[0]), jnp.float32),
         initializer(subkey, (1, RNN_SIZE), jnp.float32),
-        sample_encoded,
-    )
-    rssm_opt_state = optimizer.init(rssm_params)
-
-    obs_nn = Observation()
-    random_key, subkey = random.split(random_key)
-    obs_params = obs_nn.init(
         subkey,
-        initializer(subkey, (1, STATE_DIM), jnp.float32),
-        initializer(subkey, (1, RNN_SIZE), jnp.float32),
     )
-    obs_opt_state = optimizer.init(obs_params)
-
-    reward_nn = Reward()
-    random_key, subkey = random.split(random_key)
-    reward_params = reward_nn.init(
-        subkey,
-        initializer(subkey, (1, STATE_DIM), jnp.float32),
-        initializer(subkey, (1, RNN_SIZE), jnp.float32),
-    )
-    reward_opt_state = optimizer.init(reward_params)
+    joint_opt_state = optimizer.init(joint_params)
 
     rb = ReplayBuffer(BUFFER_SIZE, PIXEL_OBS_SHAPE[1:], env.action_space.shape[0])
 
     @jax.jit
-    @jax.value_and_grad
-    def reward_loss_and_grad(params, states, rnn_hidden_states, rewards):
-        predicted_rewards = reward_nn.apply(params, states, rnn_hidden_states)
-
-        reward_loss = (
-            0.5 * jnp.power(predicted_rewards[1:] - rewards[1:], 2).mean([0, 1]).sum()
-        )
-        return reward_loss
-
-    @jax.jit
-    def reconstruction_loss(params, states, rnn_hidden_states, observations):
-        reconstructed_obs = obs_nn.apply(params, states, rnn_hidden_states).reshape(
-            (CHUNK_LENGTH, BATCH_SIZE, PIXEL_OBS_SHAPE[1], PIXEL_OBS_SHAPE[2], 3)
-        )
-
-        obs_loss = (
-            0.5
-            * jnp.power(reconstructed_obs[1:] - observations[1:], 2).mean([0, 1]).sum()
-        )
-
-        return obs_loss, (reconstructed_obs)
-
-    reconstruction_loss_and_grad = jax.value_and_grad(reconstruction_loss, has_aux=True)
-
-    @jax.jit
-    def rssm_loss(params, embedded_obs: chex.Array, actions: chex.Array, random_key):
+    def joint_loss(
+        params,
+        observations: chex.Array,
+        actions: chex.Array,
+        rewards: chex.Array,
+        random_key,
+    ):
         # from https://github.com/cross32768/PlaNet_PyTorch/blob/master/train.py
         state = jnp.zeros((BATCH_SIZE, STATE_DIM))
-        states = jnp.zeros((CHUNK_LENGTH, BATCH_SIZE, STATE_DIM))
         rnn_hidden_state = jnp.zeros((BATCH_SIZE, RNN_SIZE))
+
+        states = jnp.zeros((CHUNK_LENGTH, BATCH_SIZE, STATE_DIM))
+        reconstructed_observations = jnp.zeros(
+            (CHUNK_LENGTH, BATCH_SIZE, *PIXEL_OBS_SHAPE[1:])
+        )
+        reconstructed_rewards = jnp.zeros((CHUNK_LENGTH, BATCH_SIZE, 1))
         rnn_hidden_states = jnp.zeros((CHUNK_LENGTH, BATCH_SIZE, RNN_SIZE))
 
-        kl_loss = 0
+        kl_loss = 0.0
+
         for l in range(CHUNK_LENGTH - 1):
             random_key, subkey = random.split(random_key)
 
-            (next_state_prior, next_state_posterior, rnn_hidden_state,) = rssm_nn.apply(
-                params, state, actions[l], rnn_hidden_state, embedded_obs[l + 1]
+            (
+                next_state_prior,
+                next_state_posterior,
+                next_state_sample,
+                rnn_hidden_state,
+                reconstructed_reward,
+                reconstructed_observation,
+            ) = joint_nn.apply(
+                params, observations[l + 1], state, actions[l], rnn_hidden_state, subkey
             )
-            state = next_state_posterior.sample(seed=subkey)
-            states = states.at[l + 1].set(state)
+
+            states = states.at[l + 1].set(next_state_sample)
             rnn_hidden_states = rnn_hidden_states.at[l + 1].set(rnn_hidden_state)
-            kl = next_state_prior.kl_divergence(next_state_posterior).sum(1)
-            kl_loss += jax.lax.clamp(x=kl, min=3.0, max=1e8).mean()
+
+            reconstructed_observations = reconstructed_observations.at[l + 1].set(
+                reconstructed_observation
+            )
+            reconstructed_rewards = reconstructed_rewards.at[l + 1].set(
+                reconstructed_reward
+            )
+
+            kl = next_state_posterior.kl_divergence(next_state_prior)
+            kl_loss += jax.lax.clamp(x=kl, min=3.0, max=1e6).mean()
+
+            reconstruction_loss = (
+                0.5
+                * jnp.power(reconstructed_observation - observations[l + 1], 2)
+                .mean([0, 1])
+                .sum()
+            )
+            reward_loss = (
+                0.5
+                * jnp.power(reconstructed_rewards - rewards[l + 1], 2)
+                .mean([0, 1])
+                .sum()
+            )
 
         kl_loss /= CHUNK_LENGTH - 1
-        return kl_loss, (states, rnn_hidden_states)
+        reconstruction_loss /= CHUNK_LENGTH - 1
+        reward_loss /= CHUNK_LENGTH - 1
 
-    rssm_loss_and_grad = jax.value_and_grad(rssm_loss, has_aux=True)
+        joint_loss = kl_loss + reconstruction_loss + reward_loss
+
+        return joint_loss, (
+            (kl_loss, reconstruction_loss, reward_loss),
+            states,
+            reconstructed_observations,
+            reconstructed_rewards,
+            rnn_hidden_states,
+        )
+
+    joint_loss_and_grad = jax.value_and_grad(joint_loss, has_aux=True)
+
+    @jax.jit
+    def update_joint_nn(
+        joint_params, joint_opt_state, observations, actions, rewards, random_key
+    ):
+
+        random_key, subkey = random.split(random_key)
+        (
+            (
+                cummulative_loss,
+                (
+                    (kl_loss, reconstruction_loss, reward_loss),
+                    states,
+                    reconstructed_observations,
+                    reconstructed_rewards,
+                    rnn_hidden_states,
+                ),
+            ),
+            joint_grad,
+        ) = joint_loss_and_grad(
+            joint_params,
+            observations,
+            actions,
+            rewards,
+            subkey,
+        )
+
+        updates, joint_opt_state = optimizer.update(joint_grad, joint_opt_state)
+        joint_params = optax.apply_updates(joint_params, updates)
+
+        return (
+            (cummulative_loss, kl_loss, reconstruction_loss, reward_loss),
+            joint_params,
+            joint_opt_state,
+            states,
+            rnn_hidden_states,
+            reconstructed_observations,
+            reconstructed_rewards,
+        )
 
     env.reset()
     current_observations = np.zeros(PIXEL_OBS_SHAPE[1:])
@@ -290,48 +354,54 @@ def dreamer():
         rb.push(current_observations, actions, rewards, dones)
         current_observations = next_observations["pixels"]
 
+        if dones or global_step % MAX_EPISODE_LENGTH == 0:
+            env.reset()
+
         if len(rb) < BATCH_SIZE:
             continue
 
         for _ in range(N_UPDATE_STEPS):
             observations, actions, rewards, _ = rb.sample(BATCH_SIZE, CHUNK_LENGTH)
 
+            observations = preprocess_obs(observations)
             # Adjust dimensions to match (chuck_size, batch_size, ...) pattern
             observations = jnp.transpose(observations, (1, 0, 2, 3, 4))
             actions = jnp.transpose(actions, (1, 0, 2))
             rewards = jnp.transpose(rewards, (1, 0, 2))
 
-            # Dynamics Learning
-            # ~~~~~~~~~~~~~~~~~~~
-            # In original paper these parameters are shared with the RSSM
-            # Here for simplicity they are separate networks
-            embedded_obs = encoder_nn.apply(encoder_params, observations).reshape(
-                CHUNK_LENGTH, BATCH_SIZE, -1
+            # We train a model jointly
+            random_key, subkey = random.split(random_key)
+            (
+                (cummulative_loss, kl_loss, reconstruction_loss, reward_loss),
+                joint_params,
+                joint_opt_state,
+                states,
+                rnn_hidden_states,
+                reconstructed_observations,
+                reconstructed_rewards,
+            ) = update_joint_nn(
+                joint_params,
+                joint_opt_state,
+                observations,
+                actions,
+                rewards,
+                random_key,
             )
 
-            random_key, subkey = random.split(random_key)
-            (kl_loss, (states, rnn_hidden_states)), rssm_grad = rssm_loss_and_grad(
-                rssm_params, embedded_obs, actions, subkey
+            writer.add_scalar(
+                "loss/cummulative", np.array(cummulative_loss), global_step
             )
             writer.add_scalar("loss/rssm_kl", np.array(kl_loss), global_step)
-            updates, rssm_opt_state = optimizer.update(rssm_grad, rssm_opt_state)
-            rssm_params = optax.apply_updates(rssm_params, updates)
-
-            reward_loss, reward_grad = reward_loss_and_grad(
-                reward_params, states, rnn_hidden_states, rewards
-            )
             writer.add_scalar("loss/reward", np.array(reward_loss), global_step)
-            updates, reward_opt_state = optimizer.update(reward_grad, reward_opt_state)
-            reward_params = optax.apply_updates(reward_params, updates)
-
-            (obs_loss, (reconstructed_obs),), obs_grad = reconstruction_loss_and_grad(
-                obs_params, states, rnn_hidden_states, observations
+            writer.add_scalar(
+                "loss/reconstruction", np.array(reconstruction_loss), global_step
             )
 
             writer.add_image(
                 "image/original",
                 np.transpose(
-                    np.array(observations[1][0] * 255).astype(np.uint8), (2, 0, 1)
+                    np.array(observations[1][10] * 255).astype(np.uint8),
+                    (2, 0, 1),
                 ),
                 global_step,
             )
@@ -339,14 +409,11 @@ def dreamer():
             writer.add_image(
                 "image/reconstructed",
                 np.transpose(
-                    np.array(reconstructed_obs[1][0] * 255).astype(np.uint8), (2, 0, 1)
+                    np.array(reconstructed_observations[1][10] * 255).astype(np.uint8),
+                    (2, 0, 1),
                 ),
                 global_step,
             )
-
-            writer.add_scalar("loss/observation", np.array(obs_loss), global_step)
-            updates, obs_opt_state = optimizer.update(obs_grad, obs_opt_state)
-            obs_params = optax.apply_updates(obs_params, updates)
 
 
 def preprocess_obs(obs, bit_depth=5):
@@ -396,10 +463,6 @@ class ReplayBuffer(object):
         if self.index == self.capacity - 1:
             self.is_filled = True
         self.index = (self.index + 1) % self.capacity
-
-        # print(observation.shape)
-        # im = Image.fromarray((observation * 255).astype(np.uint8))
-        # im.save("images/{index}.jpeg".format(index=self.index))
 
     def sample(self, batch_size, chunk_length):
         """
