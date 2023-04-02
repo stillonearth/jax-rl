@@ -22,7 +22,7 @@ RNN_SIZE = 100  # 200
 STATE_DIM = 32  # 64 wirks better
 PIXEL_OBS_SHAPE = (1, 64, 64, 3)
 
-ACTOR_DIM = 128  # 256
+ACTOR_CRITIC_DIM = 128  # 256
 LOG_STD_MAX = 4
 LOG_STD_MIN = -20
 
@@ -156,8 +156,8 @@ class RSSM(nn.Module):
 
 class Reward(nn.Module):
     @nn.compact
-    def __call__(self, obs: chex.Array, rnn_state: chex.Array):
-        x = jnp.concatenate([obs, rnn_state], -1)
+    def __call__(self, state: chex.Array, rnn_hidden: chex.Array):
+        x = jnp.concatenate([state, rnn_hidden], -1)
         x = nn.relu(nn.Dense(features=HIDDEN_DIM, name="fc1")(x))
         x = nn.relu(nn.Dense(features=HIDDEN_DIM, name="fc2")(x))
         x = nn.relu(nn.Dense(features=HIDDEN_DIM, name="fc3")(x))
@@ -195,13 +195,30 @@ class JointModel(nn.Module):
         )
 
 
-class NextStatePrior(nn.Module):
+class NextStatePriorAndReward(nn.Module):
     @nn.compact
     def __call__(self, state, action, rnn_hidden):
         next_state_prior, _, rnn_hidden = RSSM()(
             state, action, rnn_hidden, jnp.zeros((1, 4096))
         )
-        return next_state_prior, rnn_hidden
+        reward = Reward()(state, rnn_hidden)
+        return next_state_prior, rnn_hidden, reward
+
+
+class Value(nn.Module):
+
+    action_size: int
+    state_size: int
+
+    @nn.compact
+    def __call__(self, x):
+        dtype = jnp.float32
+
+        x = nn.relu(nn.Dense(features=ACTOR_CRITIC_DIM, name="fc1", dtype=dtype)(x))
+        x = nn.relu(nn.Dense(features=ACTOR_CRITIC_DIM, name="fc2", dtype=dtype)(x))
+        x = nn.Dense(features=1, name="fc_out", dtype=dtype)(x)
+
+        return x
 
 
 class Actor(nn.Module):
@@ -212,8 +229,8 @@ class Actor(nn.Module):
     def __call__(self, x):
         dtype = jnp.float32
 
-        x = nn.relu(nn.Dense(features=ACTOR_DIM, name="fc1", dtype=dtype)(x))
-        x = nn.relu(nn.Dense(features=ACTOR_DIM, name="fc2", dtype=dtype)(x))
+        x = nn.relu(nn.Dense(features=ACTOR_CRITIC_DIM, name="fc1", dtype=dtype)(x))
+        x = nn.relu(nn.Dense(features=ACTOR_CRITIC_DIM, name="fc2", dtype=dtype)(x))
         mean = nn.Dense(features=self.action_size, name="fc_mean", dtype=dtype)(x)
         log_std = nn.tanh(
             nn.Dense(features=self.action_size, name="fc_logstd", dtype=dtype)(x)
@@ -233,14 +250,13 @@ def dreamer():
 
     # Optimizers
     joint_optimizer = optax.adam(learning_rate=LEARNING_RATE)
-    actor_optimizer = optax.chain(
+    actor_critic_optimizer = optax.chain(
         optax.clip_by_global_norm(1.0), optax.adam(learning_rate=LEARNING_RATE)
     )
 
-    # Neural Networks
+    # NNs
     initializer = jax.nn.initializers.xavier_uniform()
-
-    # RSSM joint model
+    # Joint RSSM NN
     joint_nn = JointModel()
     random_key, subkey = random.split(random_key)
     joint_params = joint_nn.init(
@@ -253,7 +269,7 @@ def dreamer():
     )
     joint_opt_state = joint_optimizer.init(joint_params)
 
-    # Policy Network
+    # Actor (Policy) NN
     action_dim = orig_env.action_space.shape[0]
     actor = Actor(state_size=(1, STATE_DIM), action_size=action_dim)
     random_key, subkey = random.split(random_key)
@@ -261,13 +277,22 @@ def dreamer():
         subkey,
         initializer(subkey, (1, STATE_DIM), jnp.float32),
     )
-    actor_opt_state = actor_optimizer.init(actor_params)
+    actor_opt_state = actor_critic_optimizer.init(actor_params)
 
     action_scale = (orig_env.action_space.high - orig_env.action_space.low) / 2.0
     action_bias = (orig_env.action_space.high + orig_env.action_space.low) / 2.0
 
-    # Next State Prior
-    next_state_prior_nn = NextStatePrior()
+    # Next State Prior NN
+    next_state_prior_and_reward_nn = NextStatePriorAndReward()
+
+    # Critic (Value) NN
+    value_nn = Value(state_size=(1, STATE_DIM), action_size=action_dim)
+    random_key, subkey = random.split(random_key)
+    value_params = value_nn.init(
+        subkey,
+        initializer(subkey, (1, STATE_DIM), jnp.float32),
+    )
+    value_opt_state = actor_critic_optimizer.init(value_params)
 
     rb = ReplayBuffer(BUFFER_SIZE, PIXEL_OBS_SHAPE[1:], env.action_space.shape[0])
 
@@ -402,9 +427,6 @@ def dreamer():
             reconstructed_rewards,
         )
 
-    env.reset()
-    current_observations = np.zeros(PIXEL_OBS_SHAPE[1:])
-
     @jax.jit
     def imagine_trajectories(states, rnn_hidden_states, random_key):
         trajectories = []
@@ -414,13 +436,29 @@ def dreamer():
                 random_key, subkey1, subkey2 = random.split(random_key, 3)
                 # Get next best action from policy
                 action, _ = get_action(actor_params, states[i].reshape(1, -1), subkey1)
-                trajectory.append((states[i], action))
 
-                next_state_prior, rnn_hidden_state = next_state_prior_nn.apply(
+                (
+                    next_state_prior,
+                    rnn_hidden_state,
+                    reward,
+                ) = next_state_prior_and_reward_nn.apply(
                     joint_params,
                     states[i].reshape(1, -1),
                     action.reshape(1, -1),
                     rnn_hidden_states[i].reshape(1, -1),
+                )
+
+                value = value_nn.apply(value_params, states[i].reshape(1, -1))
+                value_target = 0.0
+
+                trajectory.append(
+                    (
+                        states[i].reshape(-1),
+                        action.reshape(-1),
+                        reward.reshape(-1),
+                        value.reshape(-1),
+                        value_target,
+                    )
                 )
 
                 rnn_hidden_states = rnn_hidden_states.at[i].set(
@@ -430,7 +468,31 @@ def dreamer():
                 states = states.at[i].set(state_sample.reshape(-1))
 
             trajectories.append(trajectory)
+
+        # def estimate_value(trajectory, offset) -> np.array:
+        #     """Estimates the value of the given state."""
+        #     # Uses Equation (5) from paper https://arxiv.org/pdf/1912.01603.pdf
+        #     # Should be switched to Equation (7) once rest of implementation is verified
+
+        #     print(len(trajectory))
+
+        #     for t in trajectory[offset:]:
+        #         print(len(t))
+        #         print(t[2])
+        #         print("----")
+
+        #     rewards = jnp.array([t[2] for t in trajectory[offset:]])
+        #     return jnp.sum(rewards)
+
+        # for j, trajectory in enumerate(trajectories):
+        #     for h in range(IMAGINATION_HORIZON):
+        #         value_estimate = estimate_value(trajectory, h)
+        #         trajectories[j][4] = value_estimate
+
         return trajectories
+
+    env.reset()
+    current_observations = np.zeros(PIXEL_OBS_SHAPE[1:])
 
     for global_step in tqdm(range(TOTAL_TIMESTEPS)):
         if global_step < SEED_EPISODES:
@@ -468,7 +530,7 @@ def dreamer():
                 states,
                 rnn_hidden_states,
                 reconstructed_observations,
-                reconstructed_rewards,
+                _reconstructed_rewards,
             ) = update_joint_nn(
                 joint_params,
                 joint_opt_state,
@@ -505,10 +567,7 @@ def dreamer():
                 global_step,
             )
 
-            # at this point we could copy joint params to RAM and free GPU memory
-            # here's the code
-
-            # Imagine trajectories from each state
+            # Imagine trajectories (s, a, r, v) from each state
             random_key, subkey = random.split(random_key)
             trajectories = imagine_trajectories(
                 states.reshape((-1, STATE_DIM)),
