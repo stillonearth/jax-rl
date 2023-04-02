@@ -17,23 +17,25 @@ from skimage.transform import resize
 from torch.utils.tensorboard import SummaryWriter
 
 
-HIDDEN_DIM = 200
-RNN_SIZE = 200
-STATE_DIM = 64
+HIDDEN_DIM = 100  # 200
+RNN_SIZE = 100  # 200
+STATE_DIM = 32  # 64 wirks better
 PIXEL_OBS_SHAPE = (1, 64, 64, 3)
 
-BATCH_SIZE = 50
-BUFFER_SIZE = 1_000_000
-CHUNK_LENGTH = 10
+ACTOR_DIM = 128  # 256
+LOG_STD_MAX = 4
+LOG_STD_MIN = -20
+
+BATCH_SIZE = 25  # 50
+BUFFER_SIZE = 500_000  # 1_000_000
+CHUNK_LENGTH = 5  # 10
 ENV_NAME = "HalfCheetah-v4"
-IMAGINATION_HORIZON = 12
+IMAGINATION_HORIZON = 6  # 12
 LEARNING_RATE = 1e-3
 N_INTERACTION_STEPS = 1
 N_UPDATE_STEPS = 1
 SEED_EPISODES = 1_000_000_000
-SEQUENCE_LENGTH = 50
 TOTAL_TIMESTEPS = 1_000_000_000
-FREE_NATS = 3.0
 DISCOUNT = 0.2
 MAX_EPISODE_LENGTH = 100
 
@@ -110,7 +112,7 @@ class RSSM(nn.Module):
         Return prior p(s_t+1 | h_t+1) and posterior p(s_t+1 | h_t+1, o_t+1)
         for model training
         """
-        # next_state_encoded = Encoder()(observation).reshape((observation.shape[0], -1))
+
         next_state_prior, rnn_hidden = self.prior(state, action, rnn_hidden)
         next_state_posterior = self.posterior(rnn_hidden, next_state_encoded)
         return next_state_prior, next_state_posterior, rnn_hidden
@@ -172,16 +174,14 @@ class JointModel(nn.Module):
         rnn_hidden: chex.Array,
         random_key,
     ):
-
         batch_size = observations.shape[0]
-
         next_state_encoded = Encoder()(observations).reshape(batch_size, -1)
 
         next_state_prior, next_state_posterior, rnn_hidden = RSSM()(
             states, actions, rnn_hidden, next_state_encoded
         )
-
         next_state_sample = next_state_posterior.sample(seed=random_key)
+
         reconstructed_reward = Reward()(next_state_sample, rnn_hidden)
         reconstructed_observation = Decoder()(next_state_sample, rnn_hidden)
 
@@ -195,20 +195,52 @@ class JointModel(nn.Module):
         )
 
 
+class NextStatePrior(nn.Module):
+    @nn.compact
+    def __call__(self, state, action, rnn_hidden):
+        next_state_prior, _, rnn_hidden = RSSM()(
+            state, action, rnn_hidden, jnp.zeros((1, 4096))
+        )
+        return next_state_prior, rnn_hidden
+
+
+class Actor(nn.Module):
+    action_size: int
+    state_size: int
+
+    @nn.compact
+    def __call__(self, x):
+        dtype = jnp.float32
+
+        x = nn.relu(nn.Dense(features=ACTOR_DIM, name="fc1", dtype=dtype)(x))
+        x = nn.relu(nn.Dense(features=ACTOR_DIM, name="fc2", dtype=dtype)(x))
+        mean = nn.Dense(features=self.action_size, name="fc_mean", dtype=dtype)(x)
+        log_std = nn.tanh(
+            nn.Dense(features=self.action_size, name="fc_logstd", dtype=dtype)(x)
+        )
+
+        log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (log_std + 1)
+
+        return mean, log_std
+
+
 def dreamer():
     writer = SummaryWriter()
-    env = gym.wrappers.PixelObservationWrapper(
-        gym.make(ENV_NAME, render_mode="rgb_array")
-    )
+    orig_env = gym.make(ENV_NAME, render_mode="rgb_array")
+    env = gym.wrappers.PixelObservationWrapper(orig_env)
 
     random_key = random.PRNGKey(0)
 
     # Optimizers
-    optimizer = optax.adam(learning_rate=LEARNING_RATE)
+    joint_optimizer = optax.adam(learning_rate=LEARNING_RATE)
+    actor_optimizer = optax.chain(
+        optax.clip_by_global_norm(1.0), optax.adam(learning_rate=LEARNING_RATE)
+    )
 
     # Neural Networks
     initializer = jax.nn.initializers.xavier_uniform()
 
+    # RSSM joint model
     joint_nn = JointModel()
     random_key, subkey = random.split(random_key)
     joint_params = joint_nn.init(
@@ -219,9 +251,39 @@ def dreamer():
         initializer(subkey, (1, RNN_SIZE), jnp.float32),
         subkey,
     )
-    joint_opt_state = optimizer.init(joint_params)
+    joint_opt_state = joint_optimizer.init(joint_params)
+
+    # Policy Network
+    action_dim = orig_env.action_space.shape[0]
+    actor = Actor(state_size=(1, STATE_DIM), action_size=action_dim)
+    random_key, subkey = random.split(random_key)
+    actor_params = actor.init(
+        subkey,
+        initializer(subkey, (1, STATE_DIM), jnp.float32),
+    )
+    actor_opt_state = actor_optimizer.init(actor_params)
+
+    action_scale = (orig_env.action_space.high - orig_env.action_space.low) / 2.0
+    action_bias = (orig_env.action_space.high + orig_env.action_space.low) / 2.0
+
+    # Next State Prior
+    next_state_prior_nn = NextStatePrior()
 
     rb = ReplayBuffer(BUFFER_SIZE, PIXEL_OBS_SHAPE[1:], env.action_space.shape[0])
+
+    # Sampling
+    @jax.jit
+    def get_action(params, x, random_key, sigma=1e-6):
+        mean, log_std = actor.apply(params, x)
+        std = jnp.exp(log_std)
+        normal = distrax.Normal(mean, std)
+        x_t, log_prob = normal.sample_and_log_prob(seed=random_key)
+        y_t = jnp.tanh(x_t)
+        action = y_t * action_scale + action_bias
+
+        log_prob -= jnp.log(action_scale * (1 - y_t**2) + sigma)
+        log_prob = log_prob.sum(1, keepdims=True)
+        return action, log_prob
 
     @jax.jit
     def joint_loss(
@@ -307,8 +369,6 @@ def dreamer():
     def update_joint_nn(
         joint_params, joint_opt_state, observations, actions, rewards, random_key
     ):
-
-        random_key, subkey = random.split(random_key)
         (
             (
                 cummulative_loss,
@@ -326,10 +386,10 @@ def dreamer():
             observations,
             actions,
             rewards,
-            subkey,
+            random_key,
         )
 
-        updates, joint_opt_state = optimizer.update(joint_grad, joint_opt_state)
+        updates, joint_opt_state = joint_optimizer.update(joint_grad, joint_opt_state)
         joint_params = optax.apply_updates(joint_params, updates)
 
         return (
@@ -344,6 +404,33 @@ def dreamer():
 
     env.reset()
     current_observations = np.zeros(PIXEL_OBS_SHAPE[1:])
+
+    @jax.jit
+    def imagine_trajectories(states, rnn_hidden_states, random_key):
+        trajectories = []
+        for i in (0, states.shape[0]):
+            trajectory = []
+            for _ in range(0, IMAGINATION_HORIZON):
+                random_key, subkey1, subkey2 = random.split(random_key, 3)
+                # Get next best action from policy
+                action, _ = get_action(actor_params, states[i].reshape(1, -1), subkey1)
+                trajectory.append((states[i], action))
+
+                next_state_prior, rnn_hidden_state = next_state_prior_nn.apply(
+                    joint_params,
+                    states[i].reshape(1, -1),
+                    action.reshape(1, -1),
+                    rnn_hidden_states[i].reshape(1, -1),
+                )
+
+                rnn_hidden_states = rnn_hidden_states.at[i].set(
+                    rnn_hidden_state.reshape(-1)
+                )
+                state_sample = next_state_prior.sample(seed=subkey2)
+                states = states.at[i].set(state_sample.reshape(-1))
+
+            trajectories.append(trajectory)
+        return trajectories
 
     for global_step in tqdm(range(TOTAL_TIMESTEPS)):
         if global_step < SEED_EPISODES:
@@ -417,6 +504,19 @@ def dreamer():
                 ),
                 global_step,
             )
+
+            # at this point we could copy joint params to RAM and free GPU memory
+            # here's the code
+
+            # Imagine trajectories from each state
+            random_key, subkey = random.split(random_key)
+            trajectories = imagine_trajectories(
+                states.reshape((-1, STATE_DIM)),
+                rnn_hidden_states.reshape((-1, RNN_SIZE)),
+                subkey,
+            )
+
+            # exit()
 
 
 def preprocess_obs(obs, bit_depth=5):
