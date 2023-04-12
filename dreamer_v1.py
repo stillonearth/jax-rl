@@ -206,7 +206,6 @@ class NextStatePriorAndReward(nn.Module):
 
 
 class Value(nn.Module):
-
     action_size: int
     state_size: int
 
@@ -427,6 +426,27 @@ def dreamer():
             reconstructed_rewards,
         )
 
+    # @jax.jit
+    def estimate_value(trajectory, tau, lambda_=0.1) -> jnp.array:
+        """Estimates the value of the given state."""
+
+        rewards = jnp.array([t[2] for t in trajectory])
+        values = jnp.array([t[3] for t in trajectory])
+
+        def V_N(k, tau):
+            V_N = 0.0
+            h = np.min([tau + k, 0 + IMAGINATION_HORIZON])
+            for n in range(tau, h):
+                V_N += DISCOUNT ** (n - tau) * rewards[n]
+            return V_N + (DISCOUNT ** (h - tau)) * values[h]
+
+        V_lambda = 0.0
+        for n in range(0, IMAGINATION_HORIZON):
+            V_lambda += (1 - lambda_) * (lambda_ ** (n - 1) * V_N(n, tau))
+        V_lambda += lambda_ ** (IMAGINATION_HORIZON - 1) * V_N(IMAGINATION_HORIZON, tau)
+
+        return V_lambda
+
     @jax.jit
     def imagine_trajectories(states, rnn_hidden_states, random_key):
         trajectories = []
@@ -448,17 +468,16 @@ def dreamer():
                     rnn_hidden_states[i].reshape(1, -1),
                 )
 
-                value = value_nn.apply(value_params, states[i].reshape(1, -1))
-                value_target = 0.0
+                value = value_nn.apply(value_params, states[i].reshape(-1))
 
                 trajectory.append(
-                    (
+                    [
                         states[i].reshape(-1),
                         action.reshape(-1),
                         reward.reshape(-1),
                         value.reshape(-1),
-                        value_target,
-                    )
+                        jnp.zeros_like(value),
+                    ]
                 )
 
                 rnn_hidden_states = rnn_hidden_states.at[i].set(
@@ -468,27 +487,11 @@ def dreamer():
                 states = states.at[i].set(state_sample.reshape(-1))
 
             trajectories.append(trajectory)
-
-        # def estimate_value(trajectory, offset) -> np.array:
-        #     """Estimates the value of the given state."""
-        #     # Uses Equation (5) from paper https://arxiv.org/pdf/1912.01603.pdf
-        #     # Should be switched to Equation (7) once rest of implementation is verified
-
-        #     print(len(trajectory))
-
-        #     for t in trajectory[offset:]:
-        #         print(len(t))
-        #         print(t[2])
-        #         print("----")
-
-        #     rewards = jnp.array([t[2] for t in trajectory[offset:]])
-        #     return jnp.sum(rewards)
-
-        # for j, trajectory in enumerate(trajectories):
-        #     for h in range(IMAGINATION_HORIZON):
-        #         value_estimate = estimate_value(trajectory, h)
-        #         trajectories[j][4] = value_estimate
-
+        # Augment trajectories with value targets
+        for i, trajectory in enumerate(trajectories):
+            for k, _ in enumerate(trajectory[4]):
+                value = estimate_value(trajectory, k)
+                trajectories[i][4][k] = value
         return trajectories
 
     env.reset()
