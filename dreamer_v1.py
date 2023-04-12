@@ -426,29 +426,8 @@ def dreamer():
             reconstructed_rewards,
         )
 
-    # @jax.jit
-    def estimate_value(trajectory, tau, lambda_=0.1) -> jnp.array:
-        """Estimates the value of the given state."""
-
-        rewards = jnp.array([t[2] for t in trajectory])
-        values = jnp.array([t[3] for t in trajectory])
-
-        def V_N(k, tau):
-            V_N = 0.0
-            h = np.min([tau + k, 0 + IMAGINATION_HORIZON])
-            for n in range(tau, h):
-                V_N += DISCOUNT ** (n - tau) * rewards[n]
-            return V_N + (DISCOUNT ** (h - tau)) * values[h]
-
-        V_lambda = 0.0
-        for n in range(0, IMAGINATION_HORIZON):
-            V_lambda += (1 - lambda_) * (lambda_ ** (n - 1) * V_N(n, tau))
-        V_lambda += lambda_ ** (IMAGINATION_HORIZON - 1) * V_N(IMAGINATION_HORIZON, tau)
-
-        return V_lambda
-
     @jax.jit
-    def imagine_trajectories(states, rnn_hidden_states, random_key):
+    def imagine_trajectories(actor_params, states, rnn_hidden_states, random_key):
         trajectories = []
         for i in (0, states.shape[0]):
             trajectory = []
@@ -473,10 +452,13 @@ def dreamer():
                 trajectory.append(
                     [
                         states[i].reshape(-1),
+                        rnn_hidden_states[i].reshape(-1),
                         action.reshape(-1),
                         reward.reshape(-1),
                         value.reshape(-1),
-                        jnp.zeros_like(value),
+                        None,
+                        None,
+                        subkey1,
                     ]
                 )
 
@@ -487,12 +469,65 @@ def dreamer():
                 states = states.at[i].set(state_sample.reshape(-1))
 
             trajectories.append(trajectory)
+
+        @jax.value_and_grad
+        def estimate_value(actor_params, trajectory, tau, lambda_=0.1):
+            """Estimates the value of the given state."""
+
+            subkey = trajectory[tau][7]
+            action, _ = get_action(actor_params, states[i].reshape(1, -1), subkey)
+            (
+                _,
+                _,
+                reward,
+            ) = next_state_prior_and_reward_nn.apply(
+                joint_params,
+                trajectory[tau][0].reshape(1, -1),
+                action.reshape(1, -1),
+                trajectory[tau][1].reshape(1, -1),
+            )
+
+            values = jnp.array([t[4] for t in trajectory])
+
+            def V_N(k, tau):
+                V_N = 0.0
+                h = np.min([tau + k, 0 + IMAGINATION_HORIZON])
+                for n in range(tau, h):
+                    V_N += DISCOUNT ** (n - tau) * reward
+                return V_N + (DISCOUNT ** (h - tau)) * values[h]
+
+            V_lambda = 0.0
+            for n in range(0, IMAGINATION_HORIZON):
+                V_lambda += (1 - lambda_) * (lambda_ ** (n - 1) * V_N(n, tau))
+            V_lambda += lambda_ ** (IMAGINATION_HORIZON - 1) * V_N(
+                IMAGINATION_HORIZON, tau
+            )
+
+            return V_lambda.mean()
+
+        V_cum = 0.0
         # Augment trajectories with value targets
         for i, trajectory in enumerate(trajectories):
-            for k, _ in enumerate(trajectory[4]):
-                value = estimate_value(trajectory, k)
-                trajectories[i][4][k] = value
-        return trajectories
+            V_traj = 0.0
+            for k in range(IMAGINATION_HORIZON):
+                value, _ = estimate_value(actor_params, trajectory, k)
+                trajectories[i][k][5] = value
+                V_traj += value
+                # trajectories[i][k][6] = grad
+            V_cum += V_traj
+        V_cum /= len(trajectories)
+        return -V_cum, trajectories
+
+    imagine_trajectories_and_actor_grad = jax.value_and_grad(
+        imagine_trajectories, has_aux=True
+    )
+
+    def update_actor_params(actor_grad, actor_opt_state, actor_params):
+        updates, actor_opt_state = actor_critic_optimizer.update(
+            actor_grad, actor_opt_state
+        )
+        actor_params = optax.apply_updates(actor_params, updates)
+        return actor_grad, actor_opt_state, actor_params
 
     env.reset()
     current_observations = np.zeros(PIXEL_OBS_SHAPE[1:])
@@ -572,10 +607,16 @@ def dreamer():
 
             # Imagine trajectories (s, a, r, v) from each state
             random_key, subkey = random.split(random_key)
-            trajectories = imagine_trajectories(
+            (_, _trajectories), actor_grad = imagine_trajectories_and_actor_grad(
+                actor_params,
                 states.reshape((-1, STATE_DIM)),
                 rnn_hidden_states.reshape((-1, RNN_SIZE)),
                 subkey,
+            )
+
+            # Update action params
+            (actor_grad, actor_opt_state, actor_params) = update_actor_params(
+                actor_grad, actor_opt_state, actor_params
             )
 
             # exit()
