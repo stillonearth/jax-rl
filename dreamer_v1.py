@@ -566,8 +566,9 @@ def dreamer():
         if global_step < SEED_EPISODES:
             actions = np.array(env.action_space.sample())
         else:
-            # TODO: implement SAC sampiling
+            # TODO: implement
             # actions = action_nn.apply(action_params, prev_reps["pixels"])
+            pass
 
         next_observations, rewards, dones, _, _ = env.step(actions)
         rb.push(current_observations, actions, rewards, dones)
