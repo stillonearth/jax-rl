@@ -17,20 +17,20 @@ from skimage.transform import resize
 from torch.utils.tensorboard import SummaryWriter
 
 
-HIDDEN_DIM = 100  # 200
-RNN_SIZE = 100  # 200
-STATE_DIM = 32  # 64 wirks better
+HIDDEN_DIM = 200  # 200
+RNN_SIZE = 200  # 200
+STATE_DIM = 62  # 64 wirks better
 PIXEL_OBS_SHAPE = (1, 64, 64, 3)
 
-ACTOR_CRITIC_DIM = 128  # 256
+ACTOR_CRITIC_DIM = 64  # 256
 LOG_STD_MAX = 4
 LOG_STD_MIN = -20
 
-BATCH_SIZE = 25  # 50
+BATCH_SIZE = 50  # 50
 BUFFER_SIZE = 500_000  # 1_000_000
-CHUNK_LENGTH = 5  # 10
+CHUNK_LENGTH = 10  # 10
 ENV_NAME = "HalfCheetah-v4"
-IMAGINATION_HORIZON = 6  # 12
+IMAGINATION_HORIZON = 3  # 12
 LEARNING_RATE = 1e-3
 N_INTERACTION_STEPS = 1
 N_UPDATE_STEPS = 1
@@ -249,9 +249,13 @@ def dreamer():
 
     # Optimizers
     joint_optimizer = optax.adam(learning_rate=LEARNING_RATE)
-    actor_critic_optimizer = optax.chain(
+    actor_optimizer = optax.chain(
         optax.clip_by_global_norm(1.0), optax.adam(learning_rate=LEARNING_RATE)
     )
+    value_optimizer = optax.chain(
+        optax.clip_by_global_norm(1.0), optax.adam(learning_rate=LEARNING_RATE)
+    )
+
 
     # NNs
     initializer = jax.nn.initializers.xavier_uniform()
@@ -276,7 +280,7 @@ def dreamer():
         subkey,
         initializer(subkey, (1, STATE_DIM), jnp.float32),
     )
-    actor_opt_state = actor_critic_optimizer.init(actor_params)
+    actor_opt_state = actor_optimizer.init(actor_params)
 
     action_scale = (orig_env.action_space.high - orig_env.action_space.low) / 2.0
     action_bias = (orig_env.action_space.high + orig_env.action_space.low) / 2.0
@@ -291,7 +295,7 @@ def dreamer():
         subkey,
         initializer(subkey, (1, STATE_DIM), jnp.float32),
     )
-    value_opt_state = actor_critic_optimizer.init(value_params)
+    value_opt_state = value_optimizer.init(value_params)
 
     rb = ReplayBuffer(BUFFER_SIZE, PIXEL_OBS_SHAPE[1:], env.action_space.shape[0])
 
@@ -522,12 +526,38 @@ def dreamer():
         imagine_trajectories, has_aux=True
     )
 
+    @jax.jit
     def update_actor_params(actor_grad, actor_opt_state, actor_params):
-        updates, actor_opt_state = actor_critic_optimizer.update(
+        updates, actor_opt_state = actor_optimizer.update(
             actor_grad, actor_opt_state
         )
         actor_params = optax.apply_updates(actor_params, updates)
         return actor_grad, actor_opt_state, actor_params
+    
+    @jax.jit
+    def update_value_params(value_grad, value_opt_state, value_params):
+        updates, value_opt_state = value_optimizer.update(
+            value_grad, value_opt_state
+        )
+        value_params = optax.apply_updates(value_params, updates)
+        return value_grad, value_opt_state, value_params
+
+    @jax.jit
+    @jax.value_and_grad
+    def value_loss_and_grad(params, trajectories):
+        """Value Loss"""
+
+        def trajectory_value_loss(params, trajectory):
+            targets = jnp.array([t[5] for t in trajectory])
+            values = value_nn.apply(params, jnp.array([t[0] for t in trajectory]))
+            return 0.5 * jnp.power(values - targets, 2).mean()
+
+        loss = 0.0
+        for t in trajectories:
+            loss += trajectory_value_loss(params, t)
+        loss /= len(trajectories)
+
+        return loss
 
     env.reset()
     current_observations = np.zeros(PIXEL_OBS_SHAPE[1:])
@@ -536,8 +566,7 @@ def dreamer():
         if global_step < SEED_EPISODES:
             actions = np.array(env.action_space.sample())
         else:
-            pass
-            # TODO: Implement
+            # TODO: implement SAC sampiling
             # actions = action_nn.apply(action_params, prev_reps["pixels"])
 
         next_observations, rewards, dones, _, _ = env.step(actions)
@@ -607,19 +636,25 @@ def dreamer():
 
             # Imagine trajectories (s, a, r, v) from each state
             random_key, subkey = random.split(random_key)
-            (_, _trajectories), actor_grad = imagine_trajectories_and_actor_grad(
+            (actor_loss, trajectories), actor_grad = imagine_trajectories_and_actor_grad(
                 actor_params,
                 states.reshape((-1, STATE_DIM)),
                 rnn_hidden_states.reshape((-1, RNN_SIZE)),
                 subkey,
             )
+            writer.add_scalar("loss/actor", np.array(actor_loss), global_step)
 
             # Update action params
             (actor_grad, actor_opt_state, actor_params) = update_actor_params(
                 actor_grad, actor_opt_state, actor_params
             )
 
-            # exit()
+            # Update Value nn
+            value_loss, value_grad = value_loss_and_grad(value_params, trajectories)
+            (value_grad, value_opt_state, value_params) = update_value_params(
+                value_grad, value_opt_state, value_params
+            )
+            writer.add_scalar("loss/value", np.array(value_loss), global_step)
 
 
 def preprocess_obs(obs, bit_depth=5):
