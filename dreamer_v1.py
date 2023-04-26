@@ -19,7 +19,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 HIDDEN_DIM = 200  # 200
 RNN_SIZE = 200  # 200
-STATE_DIM = 62  # 64 wirks better
+STATE_DIM = 62  # 64 works better
 PIXEL_OBS_SHAPE = (1, 64, 64, 3)
 
 ACTOR_CRITIC_DIM = 64  # 256
@@ -34,7 +34,7 @@ IMAGINATION_HORIZON = 3  # 12
 LEARNING_RATE = 1e-3
 N_INTERACTION_STEPS = 1
 N_UPDATE_STEPS = 1
-SEED_EPISODES = 1_000_000_000
+SEED_EPISODES = 64
 TOTAL_TIMESTEPS = 1_000_000_000
 DISCOUNT = 0.2
 MAX_EPISODE_LENGTH = 100
@@ -256,7 +256,6 @@ def dreamer():
         optax.clip_by_global_norm(1.0), optax.adam(learning_rate=LEARNING_RATE)
     )
 
-
     # NNs
     initializer = jax.nn.initializers.xavier_uniform()
     # Joint RSSM NN
@@ -322,8 +321,6 @@ def dreamer():
         random_key,
     ):
         # from https://github.com/cross32768/PlaNet_PyTorch/blob/master/train.py
-        state = jnp.zeros((BATCH_SIZE, STATE_DIM))
-        rnn_hidden_state = jnp.zeros((BATCH_SIZE, RNN_SIZE))
 
         states = jnp.zeros((CHUNK_LENGTH, BATCH_SIZE, STATE_DIM))
         reconstructed_observations = jnp.zeros(
@@ -347,7 +344,12 @@ def dreamer():
                 reconstructed_reward,
                 reconstructed_observation,
             ) = joint_nn.apply(
-                params, observations[l + 1], state, actions[l], rnn_hidden_state, subkey
+                params,
+                observations[l + 1],
+                states[l],
+                actions[l],
+                rnn_hidden_states[l],
+                subkey,
             )
 
             states = states.at[l + 1].set(next_state_sample)
@@ -528,17 +530,13 @@ def dreamer():
 
     @jax.jit
     def update_actor_params(actor_grad, actor_opt_state, actor_params):
-        updates, actor_opt_state = actor_optimizer.update(
-            actor_grad, actor_opt_state
-        )
+        updates, actor_opt_state = actor_optimizer.update(actor_grad, actor_opt_state)
         actor_params = optax.apply_updates(actor_params, updates)
         return actor_grad, actor_opt_state, actor_params
-    
+
     @jax.jit
     def update_value_params(value_grad, value_opt_state, value_params):
-        updates, value_opt_state = value_optimizer.update(
-            value_grad, value_opt_state
-        )
+        updates, value_opt_state = value_optimizer.update(value_grad, value_opt_state)
         value_params = optax.apply_updates(value_params, updates)
         return value_grad, value_opt_state, value_params
 
@@ -562,16 +560,44 @@ def dreamer():
     env.reset()
     current_observations = np.zeros(PIXEL_OBS_SHAPE[1:])
 
+    # initial action
+    on_policy_actions = np.array(env.action_space.sample())
+    on_policy_rnn_hidden_state = jnp.zeros((1, RNN_SIZE))
+    on_policy_state = jnp.zeros((1, STATE_DIM))
     for global_step in tqdm(range(TOTAL_TIMESTEPS)):
         if global_step < SEED_EPISODES:
-            actions = np.array(env.action_space.sample())
-        else:
-            # TODO: implement
-            # actions = action_nn.apply(action_params, prev_reps["pixels"])
-            pass
+            on_policy_actions = np.array(env.action_space.sample())
 
-        next_observations, rewards, dones, _, _ = env.step(actions)
-        rb.push(current_observations, actions, rewards, dones)
+        else:
+            processed_current_observations = resize(
+                current_observations, (PIXEL_OBS_SHAPE[1], PIXEL_OBS_SHAPE[2])
+            )
+            processed_current_observations = (
+                processed_current_observations * 255
+            ).astype(np.uint8)
+            processed_current_observations = preprocess_obs(
+                processed_current_observations
+            )
+            random_key, subkey = random.split(random_key)
+
+            (
+                _,
+                _,
+                on_policy_state,
+                on_policy_rnn_hidden_state,
+                _,
+                _,
+            ) = joint_nn.apply(
+                joint_params,
+                np.expand_dims(processed_current_observations, 0),
+                on_policy_state,
+                np.expand_dims(on_policy_actions, 0),
+                on_policy_rnn_hidden_state,
+                subkey,
+            )
+
+        next_observations, rewards, dones, _, _ = env.step(on_policy_actions)
+        rb.push(current_observations, on_policy_actions, rewards, dones)
         current_observations = next_observations["pixels"]
 
         if dones or global_step % MAX_EPISODE_LENGTH == 0:
@@ -637,7 +663,10 @@ def dreamer():
 
             # Imagine trajectories (s, a, r, v) from each state
             random_key, subkey = random.split(random_key)
-            (actor_loss, trajectories), actor_grad = imagine_trajectories_and_actor_grad(
+            (
+                actor_loss,
+                trajectories,
+            ), actor_grad = imagine_trajectories_and_actor_grad(
                 actor_params,
                 states.reshape((-1, STATE_DIM)),
                 rnn_hidden_states.reshape((-1, RNN_SIZE)),
@@ -741,6 +770,18 @@ class ReplayBuffer(object):
             jnp.array(sampled_rewards),
             jnp.array(sampled_done),
         )
+
+    def retreive_last(self, chunk_length):
+        """Return last n entries from history"""
+
+        sampled_observations = self.observations[-chunk_length:].reshape(
+            1, chunk_length, *self.observations.shape[1:]
+        )
+        sampled_actions = self.actions[-chunk_length:].reshape(
+            1, chunk_length, self.actions.shape[1]
+        )
+
+        return sampled_observations, sampled_actions
 
     def __len__(self):
         return self.capacity if self.is_filled else self.index
