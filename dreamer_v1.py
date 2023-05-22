@@ -17,26 +17,29 @@ from skimage.transform import resize
 from torch.utils.tensorboard import SummaryWriter
 
 
-HIDDEN_DIM = 200  # 200
-RNN_SIZE = 200  # 200
-STATE_DIM = 62  # 64 works better
+HIDDEN_DIM = 100  # 200
+RNN_SIZE = 100  # 200
+STATE_DIM = 32  # 64 works better
 PIXEL_OBS_SHAPE = (1, 64, 64, 3)
 
-ACTOR_CRITIC_DIM = 64  # 256
+ACTOR_CRITIC_DIM = 128  # 256
 LOG_STD_MAX = 4
 LOG_STD_MIN = -20
 
-BATCH_SIZE = 50  # 50
+BATCH_SIZE = 8  # 50
 BUFFER_SIZE = 500_000  # 1_000_000
-CHUNK_LENGTH = 10  # 10
+CHUNK_LENGTH = 7  # 10
 ENV_NAME = "HalfCheetah-v4"
-IMAGINATION_HORIZON = 3  # 12
-LEARNING_RATE = 1e-3
+IMAGINATION_HORIZON = 10  # 12
+LEARNING_RATE_WORLD = 6e-4
+LEARNING_RATE_VALUE = 8e-5
+LEARNING_RATE_ACTTOR = 8e-5
 N_INTERACTION_STEPS = 1
 N_UPDATE_STEPS = 1
-SEED_EPISODES = 64
+SEED_EPISODES = 32
 TOTAL_TIMESTEPS = 1_000_000_000
-DISCOUNT = 0.2
+GAMMA = 0.99
+LAMBDA = 0.95
 MAX_EPISODE_LENGTH = 100
 
 
@@ -248,12 +251,12 @@ def dreamer():
     random_key = random.PRNGKey(0)
 
     # Optimizers
-    joint_optimizer = optax.adam(learning_rate=LEARNING_RATE)
+    world_optimizer = optax.adam(learning_rate=LEARNING_RATE_WORLD)
     actor_optimizer = optax.chain(
-        optax.clip_by_global_norm(1.0), optax.adam(learning_rate=LEARNING_RATE)
+        optax.clip_by_global_norm(1.0), optax.adam(learning_rate=LEARNING_RATE_ACTTOR)
     )
     value_optimizer = optax.chain(
-        optax.clip_by_global_norm(1.0), optax.adam(learning_rate=LEARNING_RATE)
+        optax.clip_by_global_norm(1.0), optax.adam(learning_rate=LEARNING_RATE_VALUE)
     )
 
     # NNs
@@ -269,7 +272,7 @@ def dreamer():
         initializer(subkey, (1, RNN_SIZE), jnp.float32),
         subkey,
     )
-    joint_opt_state = joint_optimizer.init(joint_params)
+    joint_opt_state = world_optimizer.init(joint_params)
 
     # Actor (Policy) NN
     action_dim = orig_env.action_space.shape[0]
@@ -419,7 +422,7 @@ def dreamer():
             random_key,
         )
 
-        updates, joint_opt_state = joint_optimizer.update(joint_grad, joint_opt_state)
+        updates, joint_opt_state = world_optimizer.update(joint_grad, joint_opt_state)
         joint_params = optax.apply_updates(joint_params, updates)
 
         return (
@@ -454,7 +457,6 @@ def dreamer():
                 )
 
                 value = value_nn.apply(value_params, states[i].reshape(-1))
-
                 trajectory.append(
                     [
                         states[i].reshape(-1),
@@ -462,7 +464,7 @@ def dreamer():
                         action.reshape(-1),
                         reward.reshape(-1),
                         value.reshape(-1),
-                        None,
+                        None,  # value over history, calculated later
                         None,
                         subkey1,
                     ]
@@ -477,37 +479,23 @@ def dreamer():
             trajectories.append(trajectory)
 
         @jax.value_and_grad
-        def estimate_value(actor_params, trajectory, tau, lambda_=0.1):
+        def estimate_value(actor_params, trajectory, tau):
             """Estimates the value of the given state."""
 
-            subkey = trajectory[tau][7]
-            action, _ = get_action(actor_params, states[i].reshape(1, -1), subkey)
-            (
-                _,
-                _,
-                reward,
-            ) = next_state_prior_and_reward_nn.apply(
-                joint_params,
-                trajectory[tau][0].reshape(1, -1),
-                action.reshape(1, -1),
-                trajectory[tau][1].reshape(1, -1),
-            )
-
             values = jnp.array([t[4] for t in trajectory])
+            rewards = jnp.array([t[3] for t in trajectory])
 
-            def V_N(k, tau):
+            def V_N(k):
                 V_N = 0.0
                 h = np.min([tau + k, 0 + IMAGINATION_HORIZON])
                 for n in range(tau, h):
-                    V_N += DISCOUNT ** (n - tau) * reward
-                return V_N + (DISCOUNT ** (h - tau)) * values[h]
+                    V_N += GAMMA ** (n - tau) * rewards[n - tau]
+                return V_N + (GAMMA ** (h - tau)) * values[h]
 
             V_lambda = 0.0
             for n in range(0, IMAGINATION_HORIZON):
-                V_lambda += (1 - lambda_) * (lambda_ ** (n - 1) * V_N(n, tau))
-            V_lambda += lambda_ ** (IMAGINATION_HORIZON - 1) * V_N(
-                IMAGINATION_HORIZON, tau
-            )
+                V_lambda += (1 - LAMBDA) * (LAMBDA ** (n - 1) * V_N(n))
+            V_lambda += LAMBDA ** (IMAGINATION_HORIZON - 1) * V_N(IMAGINATION_HORIZON)
 
             return V_lambda.mean()
 
@@ -519,7 +507,8 @@ def dreamer():
                 value, _ = estimate_value(actor_params, trajectory, k)
                 trajectories[i][k][5] = value
                 V_traj += value
-                # trajectories[i][k][6] = grad
+            for k in range(IMAGINATION_HORIZON):
+                trajectories[i][k][5] = V_traj - trajectories[i][k][5]
             V_cum += V_traj
         V_cum /= len(trajectories)
         return -V_cum, trajectories
@@ -547,7 +536,8 @@ def dreamer():
 
         def trajectory_value_loss(params, trajectory):
             targets = jnp.array([t[5] for t in trajectory])
-            values = value_nn.apply(params, jnp.array([t[0] for t in trajectory]))
+            states = jnp.array([t[0] for t in trajectory])
+            values = value_nn.apply(params, states)
             return 0.5 * jnp.power(values - targets, 2).mean()
 
         loss = 0.0
@@ -564,19 +554,19 @@ def dreamer():
     on_policy_actions = np.array(env.action_space.sample())
     on_policy_rnn_hidden_state = jnp.zeros((1, RNN_SIZE))
     on_policy_state = jnp.zeros((1, STATE_DIM))
+    episodic_reward = []
     for global_step in tqdm(range(TOTAL_TIMESTEPS)):
         if global_step < SEED_EPISODES:
             on_policy_actions = np.array(env.action_space.sample())
 
         else:
-            processed_current_observations = resize(
-                current_observations, (PIXEL_OBS_SHAPE[1], PIXEL_OBS_SHAPE[2])
-            )
-            processed_current_observations = (
-                processed_current_observations * 255
-            ).astype(np.uint8)
             processed_current_observations = preprocess_obs(
-                processed_current_observations
+                (
+                    resize(
+                        current_observations, (PIXEL_OBS_SHAPE[1], PIXEL_OBS_SHAPE[2])
+                    )
+                    * 255
+                ).astype(np.uint8)
             )
             random_key, subkey = random.split(random_key)
 
@@ -597,11 +587,19 @@ def dreamer():
             )
 
         next_observations, rewards, dones, _, _ = env.step(on_policy_actions)
+        episodic_reward.append(rewards)
+
         rb.push(current_observations, on_policy_actions, rewards, dones)
         current_observations = next_observations["pixels"]
 
         if dones or global_step % MAX_EPISODE_LENGTH == 0:
             env.reset()
+            writer.add_scalar(
+                "reward/episodic",
+                np.sum(episodic_reward),
+                global_step,
+            )
+            episodic_reward = []
 
         if len(rb) < BATCH_SIZE:
             continue
@@ -679,7 +677,7 @@ def dreamer():
                 actor_grad, actor_opt_state, actor_params
             )
 
-            # Update Value nn
+            # Update Value NN
             value_loss, value_grad = value_loss_and_grad(value_params, trajectories)
             (value_grad, value_opt_state, value_params) = update_value_params(
                 value_grad, value_opt_state, value_params
@@ -785,17 +783,6 @@ class ReplayBuffer(object):
 
     def __len__(self):
         return self.capacity if self.is_filled else self.index
-
-
-class TestReplayBuffer(unittest.TestCase):
-    def test_push(self):
-        env = gym.wrappers.PixelObservationWrapper(
-            gym.make(ENV_NAME, render_mode="rgb_array")
-        )
-        rb = ReplayBuffer(BUFFER_SIZE, PIXEL_OBS_SHAPE[1:], env.action_space.shape[0])
-        actions = np.array(env.action_space.sample())
-        next_observations, rewards, dones, _, _ = env.step(actions)
-        rb.push(next_observations["pixels"], actions, rewards, dones)
 
 
 if __name__ == "__main__":

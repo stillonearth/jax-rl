@@ -31,6 +31,9 @@ A one-file mini implementation of [Dreamer (v1)](https://arxiv.org/pdf/1912.0160
 
 ![dreamer v1](https://user-images.githubusercontent.com/97428129/220439512-d2ce48cb-09cc-439f-b502-10ac1fba370a.png)
 
+**Implementation is verified up until World models**
+**Actor implementation may be hard to verify on consumer GPU**
+
 ### JAX Environmental Variables
 
 Depending on JAX version and system configuration these variables might be needed.
