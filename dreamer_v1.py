@@ -16,30 +16,31 @@ from tqdm import tqdm
 from skimage.transform import resize
 from torch.utils.tensorboard import SummaryWriter
 
+ENV_NAME = "HalfCheetah-v4"
 
-HIDDEN_DIM = 100  # 200
-RNN_SIZE = 100  # 200
-STATE_DIM = 32  # 64 works better
+HIDDEN_DIM = 200  # 200
+RNN_SIZE = 200  # 200
+STATE_DIM = 64  # 64 works better
 PIXEL_OBS_SHAPE = (1, 64, 64, 3)
 
-ACTOR_CRITIC_DIM = 128  # 256
+ACTOR_CRITIC_DIM = 256  # 256
 LOG_STD_MAX = 4
 LOG_STD_MIN = -20
 
-BATCH_SIZE = 8  # 50
-BUFFER_SIZE = 500_000  # 1_000_000
-CHUNK_LENGTH = 7  # 10
-ENV_NAME = "HalfCheetah-v4"
-IMAGINATION_HORIZON = 10  # 12
+BATCH_SIZE = 50  # 50
+CHUNK_LENGTH = 10  # 10
+IMAGINATION_HORIZON = 12  # 12
+
 LEARNING_RATE_WORLD = 6e-4
 LEARNING_RATE_VALUE = 8e-5
 LEARNING_RATE_ACTTOR = 8e-5
-N_INTERACTION_STEPS = 1
-N_UPDATE_STEPS = 1
-SEED_EPISODES = 32
-TOTAL_TIMESTEPS = 1_000_000_000
+
 GAMMA = 0.99
 LAMBDA = 0.95
+
+BUFFER_SIZE = int(1e6)
+SEED_EPISODES = int(32)
+TOTAL_TIMESTEPS = int(1e9)
 MAX_EPISODE_LENGTH = 100
 
 
@@ -167,7 +168,7 @@ class Reward(nn.Module):
         return nn.Dense(features=1, name="fc4")(x)
 
 
-class JointModel(nn.Module):
+class WorldModel(nn.Module):
     @nn.compact
     def __call__(
         self,
@@ -214,7 +215,7 @@ class Value(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        dtype = jnp.float32
+        dtype = jnp.float16
 
         x = nn.relu(nn.Dense(features=ACTOR_CRITIC_DIM, name="fc1", dtype=dtype)(x))
         x = nn.relu(nn.Dense(features=ACTOR_CRITIC_DIM, name="fc2", dtype=dtype)(x))
@@ -229,7 +230,7 @@ class Actor(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        dtype = jnp.float32
+        dtype = jnp.float16
 
         x = nn.relu(nn.Dense(features=ACTOR_CRITIC_DIM, name="fc1", dtype=dtype)(x))
         x = nn.relu(nn.Dense(features=ACTOR_CRITIC_DIM, name="fc2", dtype=dtype)(x))
@@ -262,17 +263,17 @@ def dreamer():
     # NNs
     initializer = jax.nn.initializers.xavier_uniform()
     # Joint RSSM NN
-    joint_nn = JointModel()
+    world_nn = WorldModel()
     random_key, subkey = random.split(random_key)
-    joint_params = joint_nn.init(
+    world_params = world_nn.init(
         subkey,
-        initializer(subkey, PIXEL_OBS_SHAPE, jnp.float32),
-        initializer(subkey, (1, STATE_DIM), jnp.float32),
-        initializer(subkey, (1, env.action_space.shape[0]), jnp.float32),
-        initializer(subkey, (1, RNN_SIZE), jnp.float32),
+        initializer(subkey, PIXEL_OBS_SHAPE, jnp.float16),
+        initializer(subkey, (1, STATE_DIM), jnp.float16),
+        initializer(subkey, (1, env.action_space.shape[0]), jnp.float16),
+        initializer(subkey, (1, RNN_SIZE), jnp.float16),
         subkey,
     )
-    joint_opt_state = world_optimizer.init(joint_params)
+    world_opt_state = world_optimizer.init(world_params)
 
     # Actor (Policy) NN
     action_dim = orig_env.action_space.shape[0]
@@ -280,7 +281,7 @@ def dreamer():
     random_key, subkey = random.split(random_key)
     actor_params = actor.init(
         subkey,
-        initializer(subkey, (1, STATE_DIM), jnp.float32),
+        initializer(subkey, (1, STATE_DIM), jnp.float16),
     )
     actor_opt_state = actor_optimizer.init(actor_params)
 
@@ -295,7 +296,7 @@ def dreamer():
     random_key, subkey = random.split(random_key)
     value_params = value_nn.init(
         subkey,
-        initializer(subkey, (1, STATE_DIM), jnp.float32),
+        initializer(subkey, (1, STATE_DIM), jnp.float16),
     )
     value_opt_state = value_optimizer.init(value_params)
 
@@ -316,7 +317,7 @@ def dreamer():
         return action, log_prob
 
     @jax.jit
-    def joint_loss(
+    def world_loss(
         params,
         observations: chex.Array,
         actions: chex.Array,
@@ -346,7 +347,7 @@ def dreamer():
                 rnn_hidden_state,
                 reconstructed_reward,
                 reconstructed_observation,
-            ) = joint_nn.apply(
+            ) = world_nn.apply(
                 params,
                 observations[l + 1],
                 states[l],
@@ -386,9 +387,9 @@ def dreamer():
         reconstruction_loss /= CHUNK_LENGTH - 1
         reward_loss /= CHUNK_LENGTH - 1
 
-        joint_loss = kl_loss + reconstruction_loss + reward_loss
+        wolrd_loss = kl_loss + reconstruction_loss + reward_loss
 
-        return joint_loss, (
+        return wolrd_loss, (
             (kl_loss, reconstruction_loss, reward_loss),
             states,
             reconstructed_observations,
@@ -396,11 +397,11 @@ def dreamer():
             rnn_hidden_states,
         )
 
-    joint_loss_and_grad = jax.value_and_grad(joint_loss, has_aux=True)
+    world_loss_and_grad = jax.value_and_grad(world_loss, has_aux=True)
 
     @jax.jit
-    def update_joint_nn(
-        joint_params, joint_opt_state, observations, actions, rewards, random_key
+    def update_world_nn(
+        world_params, joint_opt_state, observations, actions, rewards, random_key
     ):
         (
             (
@@ -414,8 +415,8 @@ def dreamer():
                 ),
             ),
             joint_grad,
-        ) = joint_loss_and_grad(
-            joint_params,
+        ) = world_loss_and_grad(
+            world_params,
             observations,
             actions,
             rewards,
@@ -423,11 +424,11 @@ def dreamer():
         )
 
         updates, joint_opt_state = world_optimizer.update(joint_grad, joint_opt_state)
-        joint_params = optax.apply_updates(joint_params, updates)
+        world_params = optax.apply_updates(world_params, updates)
 
         return (
             (cummulative_loss, kl_loss, reconstruction_loss, reward_loss),
-            joint_params,
+            world_params,
             joint_opt_state,
             states,
             rnn_hidden_states,
@@ -450,7 +451,7 @@ def dreamer():
                     rnn_hidden_state,
                     reward,
                 ) = next_state_prior_and_reward_nn.apply(
-                    joint_params,
+                    world_params,
                     states[i].reshape(1, -1),
                     action.reshape(1, -1),
                     rnn_hidden_states[i].reshape(1, -1),
@@ -459,13 +460,12 @@ def dreamer():
                 value = value_nn.apply(value_params, states[i].reshape(-1))
                 trajectory.append(
                     [
-                        states[i].reshape(-1),
-                        rnn_hidden_states[i].reshape(-1),
+                        states[i].reshape(-1).copy(),
+                        rnn_hidden_states[i].reshape(-1).copy(),
                         action.reshape(-1),
                         reward.reshape(-1),
-                        value.reshape(-1),
-                        None,  # value over history, calculated later
-                        None,
+                        value.reshape(-1),  # estimated value
+                        None,  # value target, calculated later
                         subkey1,
                     ]
                 )
@@ -478,18 +478,20 @@ def dreamer():
 
             trajectories.append(trajectory)
 
-        @jax.value_and_grad
-        def estimate_value(actor_params, trajectory, tau):
+        # @jax.jit
+        def estimate_value(trajectory, tau):
             """Estimates the value of the given state."""
 
             values = jnp.array([t[4] for t in trajectory])
             rewards = jnp.array([t[3] for t in trajectory])
 
+            return rewards[tau:].sum()
+
             def V_N(k):
                 V_N = 0.0
                 h = np.min([tau + k, 0 + IMAGINATION_HORIZON])
-                for n in range(tau, h):
-                    V_N += GAMMA ** (n - tau) * rewards[n - tau]
+                for i, n in enumerate(range(tau, h)):
+                    V_N += GAMMA ** (n - tau) * rewards[i]
                 return V_N + (GAMMA ** (h - tau)) * values[h]
 
             V_lambda = 0.0
@@ -504,11 +506,9 @@ def dreamer():
         for i, trajectory in enumerate(trajectories):
             V_traj = 0.0
             for k in range(IMAGINATION_HORIZON):
-                value, _ = estimate_value(actor_params, trajectory, k)
+                value = estimate_value(trajectory, k)
                 trajectories[i][k][5] = value
                 V_traj += value
-            for k in range(IMAGINATION_HORIZON):
-                trajectories[i][k][5] = V_traj - trajectories[i][k][5]
             V_cum += V_traj
         V_cum /= len(trajectories)
         return -V_cum, trajectories
@@ -556,35 +556,39 @@ def dreamer():
     on_policy_state = jnp.zeros((1, STATE_DIM))
     episodic_reward = []
     for global_step in tqdm(range(TOTAL_TIMESTEPS)):
+        processed_current_observations = preprocess_obs(
+            (
+                resize(current_observations, (PIXEL_OBS_SHAPE[1], PIXEL_OBS_SHAPE[2]))
+                * 255
+            ).astype(np.uint8)
+        )
+        random_key, subkey = random.split(random_key)
+
+        (
+            _,
+            _,
+            on_policy_state,
+            on_policy_rnn_hidden_state,
+            _,
+            _,
+        ) = world_nn.apply(
+            world_params,
+            np.expand_dims(processed_current_observations, 0),
+            on_policy_state,
+            np.expand_dims(on_policy_actions, 0),
+            on_policy_rnn_hidden_state,
+            subkey,
+        )
+
         if global_step < SEED_EPISODES:
             on_policy_actions = np.array(env.action_space.sample())
 
         else:
-            processed_current_observations = preprocess_obs(
-                (
-                    resize(
-                        current_observations, (PIXEL_OBS_SHAPE[1], PIXEL_OBS_SHAPE[2])
-                    )
-                    * 255
-                ).astype(np.uint8)
-            )
             random_key, subkey = random.split(random_key)
-
-            (
-                _,
-                _,
-                on_policy_state,
-                on_policy_rnn_hidden_state,
-                _,
-                _,
-            ) = joint_nn.apply(
-                joint_params,
-                np.expand_dims(processed_current_observations, 0),
-                on_policy_state,
-                np.expand_dims(on_policy_actions, 0),
-                on_policy_rnn_hidden_state,
-                subkey,
+            on_policy_actions, _ = get_action(
+                actor_params, on_policy_state.reshape(1, -1), subkey
             )
+            on_policy_actions = on_policy_actions.reshape(-1)
 
         next_observations, rewards, dones, _, _ = env.step(on_policy_actions)
         episodic_reward.append(rewards)
@@ -604,94 +608,91 @@ def dreamer():
         if len(rb) < BATCH_SIZE:
             continue
 
-        for _ in range(N_UPDATE_STEPS):
-            observations, actions, rewards, _ = rb.sample(BATCH_SIZE, CHUNK_LENGTH)
+        observations, actions, rewards, _ = rb.sample(BATCH_SIZE, CHUNK_LENGTH)
 
-            observations = preprocess_obs(observations)
-            # Adjust dimensions to match (chuck_size, batch_size, ...) pattern
-            observations = jnp.transpose(observations, (1, 0, 2, 3, 4))
-            actions = jnp.transpose(actions, (1, 0, 2))
-            rewards = jnp.transpose(rewards, (1, 0, 2))
+        observations = preprocess_obs(observations)
+        # Adjust dimensions to match (chuck_size, batch_size, ...) pattern
+        observations = jnp.transpose(observations, (1, 0, 2, 3, 4))
+        actions = jnp.transpose(actions, (1, 0, 2))
+        rewards = jnp.transpose(rewards, (1, 0, 2))
 
-            # We train a model jointly
-            random_key, subkey = random.split(random_key)
-            (
-                (cummulative_loss, kl_loss, reconstruction_loss, reward_loss),
-                joint_params,
-                joint_opt_state,
-                states,
-                rnn_hidden_states,
-                reconstructed_observations,
-                _reconstructed_rewards,
-            ) = update_joint_nn(
-                joint_params,
-                joint_opt_state,
-                observations,
-                actions,
-                rewards,
-                random_key,
-            )
+        # We train a model jointly
+        random_key, subkey = random.split(random_key)
+        (
+            (cummulative_loss, kl_loss, reconstruction_loss, reward_loss),
+            world_params,
+            world_opt_state,
+            states,
+            rnn_hidden_states,
+            reconstructed_observations,
+            _,
+        ) = update_world_nn(
+            world_params,
+            world_opt_state,
+            observations,
+            actions,
+            rewards,
+            random_key,
+        )
 
-            writer.add_scalar(
-                "loss/cummulative", np.array(cummulative_loss), global_step
-            )
-            writer.add_scalar("loss/rssm_kl", np.array(kl_loss), global_step)
-            writer.add_scalar("loss/reward", np.array(reward_loss), global_step)
-            writer.add_scalar(
-                "loss/reconstruction", np.array(reconstruction_loss), global_step
-            )
+        writer.add_scalar("loss/cummulative", np.array(cummulative_loss), global_step)
+        writer.add_scalar("loss/rssm_kl", np.array(kl_loss), global_step)
+        writer.add_scalar("loss/reward", np.array(reward_loss), global_step)
+        writer.add_scalar(
+            "loss/reconstruction", np.array(reconstruction_loss), global_step
+        )
 
-            writer.add_image(
-                "image/original",
-                np.transpose(
-                    np.array(observations[1][10] * 255).astype(np.uint8),
-                    (2, 0, 1),
-                ),
-                global_step,
-            )
+        writer.add_image(
+            "image/original",
+            np.transpose(
+                np.array(observations[1][10] * 255).astype(np.uint8),
+                (2, 0, 1),
+            ),
+            global_step,
+        )
 
-            writer.add_image(
-                "image/reconstructed",
-                np.transpose(
-                    np.array(reconstructed_observations[1][10] * 255).astype(np.uint8),
-                    (2, 0, 1),
-                ),
-                global_step,
-            )
+        writer.add_image(
+            "image/reconstructed",
+            np.transpose(
+                np.array(reconstructed_observations[1][10] * 255).astype(np.uint8),
+                (2, 0, 1),
+            ),
+            global_step,
+        )
 
-            # Imagine trajectories (s, a, r, v) from each state
-            random_key, subkey = random.split(random_key)
-            (
-                actor_loss,
-                trajectories,
-            ), actor_grad = imagine_trajectories_and_actor_grad(
-                actor_params,
-                states.reshape((-1, STATE_DIM)),
-                rnn_hidden_states.reshape((-1, RNN_SIZE)),
-                subkey,
-            )
-            writer.add_scalar("loss/actor", np.array(actor_loss), global_step)
+        # Imagine trajectories (s, a, r, v) from each state
+        random_key, subkey = random.split(random_key)
+        (
+            actor_loss,
+            trajectories,
+        ), actor_grad = imagine_trajectories_and_actor_grad(
+            actor_params,
+            states.reshape((-1, STATE_DIM)),
+            rnn_hidden_states.reshape((-1, RNN_SIZE)),
+            subkey,
+        )
+        writer.add_scalar("loss/actor", np.array(actor_loss), global_step)
 
-            # Update action params
-            (actor_grad, actor_opt_state, actor_params) = update_actor_params(
-                actor_grad, actor_opt_state, actor_params
-            )
+        # Update action params
+        (actor_grad, actor_opt_state, actor_params) = update_actor_params(
+            actor_grad, actor_opt_state, actor_params
+        )
 
-            # Update Value NN
-            value_loss, value_grad = value_loss_and_grad(value_params, trajectories)
-            (value_grad, value_opt_state, value_params) = update_value_params(
-                value_grad, value_opt_state, value_params
-            )
-            writer.add_scalar("loss/value", np.array(value_loss), global_step)
+        # Update Value NN
+        value_loss, value_grad = value_loss_and_grad(value_params, trajectories)
+        (value_grad, value_opt_state, value_params) = update_value_params(
+            value_grad, value_opt_state, value_params
+        )
+        writer.add_scalar("loss/value", np.array(value_loss), global_step)
 
 
-def preprocess_obs(obs, bit_depth=5):
+def preprocess_obs(obs, bit_depth=6):
     """
     Reduces the bit depth of image for the ease of training
     and convert to [-0.5, 0.5]
     In addition, add uniform random noise same as original implementation
     """
-    obs = obs.astype(np.float32)
+    obs = obs.astype(np.float16)
     reduced_obs = np.floor(obs / 2 ** (8 - bit_depth))
     normalized_obs = reduced_obs / 2**bit_depth - 0.5
     normalized_obs += np.random.uniform(0.0, 1.0 / 2**bit_depth, normalized_obs.shape)
@@ -708,8 +709,8 @@ class ReplayBuffer(object):
         self.capacity = capacity
 
         self.observations = np.zeros((capacity, *observation_shape), dtype=np.uint8)
-        self.actions = np.zeros((capacity, action_dim), dtype=np.float32)
-        self.rewards = np.zeros((capacity, 1), dtype=np.float32)
+        self.actions = np.zeros((capacity, action_dim), dtype=np.float16)
+        self.rewards = np.zeros((capacity, 1), dtype=np.float16)
         self.done = np.zeros((capacity, 1), dtype=np.bool_)
 
         self.index = 0
