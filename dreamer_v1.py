@@ -20,7 +20,7 @@ ENV_NAME = "HalfCheetah-v4"
 
 HIDDEN_DIM = 200  # 200
 RNN_SIZE = 200  # 200
-STATE_DIM = 64  # 64 works better
+STATE_DIM = 64  # 64
 PIXEL_OBS_SHAPE = (1, 64, 64, 3)
 
 ACTOR_CRITIC_DIM = 256  # 256
@@ -387,9 +387,9 @@ def dreamer():
         reconstruction_loss /= CHUNK_LENGTH - 1
         reward_loss /= CHUNK_LENGTH - 1
 
-        wolrd_loss = kl_loss + reconstruction_loss + reward_loss
+        world_loss = kl_loss + reconstruction_loss + reward_loss
 
-        return wolrd_loss, (
+        return world_loss, (
             (kl_loss, reconstruction_loss, reward_loss),
             states,
             reconstructed_observations,
@@ -437,14 +437,15 @@ def dreamer():
         )
 
     @jax.jit
-    def imagine_trajectories(actor_params, states, rnn_hidden_states, random_key):
-        trajectories = []
-        for i in (0, states.shape[0]):
+    def imagine_trajectories_with_values(actor_params, states, random_key):
+        def imagine_one_trajectory(state, random_key):
             trajectory = []
-            for _ in range(0, IMAGINATION_HORIZON):
+            rnn_hidden_state = jnp.zeros((1, RNN_SIZE))
+
+            for _j in range(0, IMAGINATION_HORIZON):
                 random_key, subkey1, subkey2 = random.split(random_key, 3)
-                # Get next best action from policy
-                action, _ = get_action(actor_params, states[i].reshape(1, -1), subkey1)
+                state = state.reshape(1, -1)
+                action, _ = get_action(actor_params, state, subkey1)
 
                 (
                     next_state_prior,
@@ -452,16 +453,16 @@ def dreamer():
                     reward,
                 ) = next_state_prior_and_reward_nn.apply(
                     world_params,
-                    states[i].reshape(1, -1),
+                    state,
                     action.reshape(1, -1),
-                    rnn_hidden_states[i].reshape(1, -1),
+                    rnn_hidden_state,
                 )
 
-                value = value_nn.apply(value_params, states[i].reshape(-1))
+                value = value_nn.apply(value_params, state.reshape(-1))
                 trajectory.append(
                     [
-                        states[i].reshape(-1).copy(),
-                        rnn_hidden_states[i].reshape(-1).copy(),
+                        state.reshape(-1),
+                        rnn_hidden_state.reshape(-1),
                         action.reshape(-1),
                         reward.reshape(-1),
                         value.reshape(-1),  # estimated value
@@ -470,51 +471,27 @@ def dreamer():
                     ]
                 )
 
-                rnn_hidden_states = rnn_hidden_states.at[i].set(
-                    rnn_hidden_state.reshape(-1)
-                )
-                state_sample = next_state_prior.sample(seed=subkey2)
-                states = states.at[i].set(state_sample.reshape(-1))
+                state = next_state_prior.sample(seed=subkey2)
 
-            trajectories.append(trajectory)
+            return trajectory
 
-        # @jax.jit
-        def estimate_value(trajectory, tau):
-            """Estimates the value of the given state."""
+        subkeys = random.split(random_key, BATCH_SIZE + 1)
+        random_key = subkeys[0]
+        trajectories = jax.vmap(imagine_one_trajectory)(
+            states, subkeys[1:]
+        )  # IMAGINATION_HORIZON x BATCH_SIZE x SHAPE
 
-            values = jnp.array([t[4] for t in trajectory])
-            rewards = jnp.array([t[3] for t in trajectory])
+        for t in range(IMAGINATION_HORIZON):
+            rewards = jnp.array([traj[3] for traj in trajectories[t:]])
+            values = rewards.sum(axis=0)
+            trajectories[t][5] = values
 
-            return rewards[tau:].sum()
+        values = jnp.array([traj[5] for traj in trajectories])
+        values_cummulative = values.sum(axis=0)
+        return -values_cummulative.mean(), trajectories
 
-            def V_N(k):
-                V_N = 0.0
-                h = np.min([tau + k, 0 + IMAGINATION_HORIZON])
-                for i, n in enumerate(range(tau, h)):
-                    V_N += GAMMA ** (n - tau) * rewards[i]
-                return V_N + (GAMMA ** (h - tau)) * values[h]
-
-            V_lambda = 0.0
-            for n in range(0, IMAGINATION_HORIZON):
-                V_lambda += (1 - LAMBDA) * (LAMBDA ** (n - 1) * V_N(n))
-            V_lambda += LAMBDA ** (IMAGINATION_HORIZON - 1) * V_N(IMAGINATION_HORIZON)
-
-            return V_lambda.mean()
-
-        V_cum = 0.0
-        # Augment trajectories with value targets
-        for i, trajectory in enumerate(trajectories):
-            V_traj = 0.0
-            for k in range(IMAGINATION_HORIZON):
-                value = estimate_value(trajectory, k)
-                trajectories[i][k][5] = value
-                V_traj += value
-            V_cum += V_traj
-        V_cum /= len(trajectories)
-        return -V_cum, trajectories
-
-    imagine_trajectories_and_actor_grad = jax.value_and_grad(
-        imagine_trajectories, has_aux=True
+    imagine_trajectories_with_value_grad = jax.value_and_grad(
+        imagine_trajectories_with_values, has_aux=True
     )
 
     @jax.jit
@@ -534,18 +511,15 @@ def dreamer():
     def value_loss_and_grad(params, trajectories):
         """Value Loss"""
 
-        def trajectory_value_loss(params, trajectory):
-            targets = jnp.array([t[5] for t in trajectory])
-            states = jnp.array([t[0] for t in trajectory])
+        def trajectory_value_loss(states, targets):
             values = value_nn.apply(params, states)
             return 0.5 * jnp.power(values - targets, 2).mean()
 
-        loss = 0.0
-        for t in trajectories:
-            loss += trajectory_value_loss(params, t)
-        loss /= len(trajectories)
+        states = jnp.array([traj[0] for traj in trajectories]).reshape(-1, STATE_DIM)
+        targets = jnp.array([traj[5] for traj in trajectories]).reshape(-1, 1)
 
-        return loss
+        loss = jax.vmap(trajectory_value_loss)(states, targets)
+        return loss.mean()
 
     env.reset()
     current_observations = np.zeros(PIXEL_OBS_SHAPE[1:])
@@ -598,6 +572,8 @@ def dreamer():
 
         if dones or global_step % MAX_EPISODE_LENGTH == 0:
             env.reset()
+            on_policy_rnn_hidden_state = jnp.zeros((1, RNN_SIZE))
+            on_policy_state = jnp.zeros((1, STATE_DIM))
             writer.add_scalar(
                 "reward/episodic",
                 np.sum(episodic_reward),
@@ -616,7 +592,7 @@ def dreamer():
         actions = jnp.transpose(actions, (1, 0, 2))
         rewards = jnp.transpose(rewards, (1, 0, 2))
 
-        # We train a model jointly
+        # Train model jointly
         random_key, subkey = random.split(random_key)
         (
             (cummulative_loss, kl_loss, reconstruction_loss, reward_loss),
@@ -665,12 +641,12 @@ def dreamer():
         (
             actor_loss,
             trajectories,
-        ), actor_grad = imagine_trajectories_and_actor_grad(
+        ), actor_grad = imagine_trajectories_with_value_grad(
             actor_params,
-            states.reshape((-1, STATE_DIM)),
-            rnn_hidden_states.reshape((-1, RNN_SIZE)),
+            states[CHUNK_LENGTH - 1].reshape((-1, STATE_DIM)),
             subkey,
         )
+
         writer.add_scalar("loss/actor", np.array(actor_loss), global_step)
 
         # Update action params
