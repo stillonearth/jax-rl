@@ -18,22 +18,22 @@ from torch.utils.tensorboard import SummaryWriter
 
 ENV_NAME = "HalfCheetah-v4"
 
-HIDDEN_DIM = 200  # 200
-RNN_SIZE = 200  # 200
+HIDDEN_DIM = 300  # 300
+RNN_SIZE = 300  # 300
 STATE_DIM = 64  # 64
 PIXEL_OBS_SHAPE = (1, 64, 64, 3)
 
-ACTOR_CRITIC_DIM = 256  # 256
+ACTOR_CRITIC_DIM = 512  # 256
 LOG_STD_MAX = 4
 LOG_STD_MIN = -20
 
 BATCH_SIZE = 50  # 50
-CHUNK_LENGTH = 10  # 10
-IMAGINATION_HORIZON = 12  # 12
+CHUNK_LENGTH = 50  # 50
+IMAGINATION_HORIZON = 15  # 15
 
-LEARNING_RATE_WORLD = 6e-4
-LEARNING_RATE_VALUE = 8e-5
-LEARNING_RATE_ACTTOR = 8e-5
+LEARNING_RATE_WORLD = 6e-4  # 6e-4
+LEARNING_RATE_VALUE = 8e-5  # 8e-5
+LEARNING_RATE_ACTOR = 8e-5  # 8e-5
 
 GAMMA = 0.99
 LAMBDA = 0.95
@@ -253,12 +253,17 @@ def dreamer():
 
     # Optimizers
     world_optimizer = optax.adam(learning_rate=LEARNING_RATE_WORLD)
-    actor_optimizer = optax.chain(
-        optax.clip_by_global_norm(1.0), optax.adam(learning_rate=LEARNING_RATE_ACTTOR)
-    )
-    value_optimizer = optax.chain(
-        optax.clip_by_global_norm(1.0), optax.adam(learning_rate=LEARNING_RATE_VALUE)
-    )
+    # world_optimizer = optax.chain(
+    #     optax.clip_by_global_norm(1.0), optax.adam(learning_rate=LEARNING_RATE_WORLD)
+    # )
+    actor_optimizer = optax.adam(learning_rate=LEARNING_RATE_ACTOR)
+    # actor_optimizer = optax.chain(
+    #     optax.clip_by_global_norm(1.0), optax.adam(learning_rate=LEARNING_RATE_ACTOR)
+    # )
+    value_optimizer = optax.adam(learning_rate=LEARNING_RATE_VALUE)
+    # value_optimizer = optax.chain(
+    #     optax.clip_by_global_norm(1.0), optax.adam(learning_rate=LEARNING_RATE_VALUE)
+    # )
 
     # NNs
     initializer = jax.nn.initializers.xavier_uniform()
@@ -367,7 +372,7 @@ def dreamer():
             )
 
             kl = next_state_posterior.kl_divergence(next_state_prior)
-            kl_loss += jax.lax.clamp(x=kl, min=3.0, max=1e6).mean()
+            kl_loss += kl.mean()  # jax.lax.clamp(x=kl, min=3.0, max=1e6).mean()
 
             reconstruction_loss += (
                 0.5
@@ -377,10 +382,7 @@ def dreamer():
             )
 
             reward_loss += (
-                0.5
-                * jnp.power(reconstructed_rewards - rewards[l + 1], 2)
-                .mean([0, 1])
-                .sum()
+                0.5 * jnp.power(reconstructed_reward - rewards[l + 1], 2).mean()
             )
 
         kl_loss /= CHUNK_LENGTH - 1
@@ -437,10 +439,11 @@ def dreamer():
         )
 
     @jax.jit
-    def imagine_trajectories_with_values(actor_params, states, random_key):
-        def imagine_one_trajectory(state, random_key):
+    def imagine_trajectories_with_values(
+        actor_params, states, rnn_hidden_states, random_key
+    ):
+        def imagine_one_trajectory(state, rnn_hidden_state, random_key):
             trajectory = []
-            rnn_hidden_state = jnp.zeros((1, RNN_SIZE))
 
             for _j in range(0, IMAGINATION_HORIZON):
                 random_key, subkey1, subkey2 = random.split(random_key, 3)
@@ -475,15 +478,36 @@ def dreamer():
 
             return trajectory
 
-        subkeys = random.split(random_key, BATCH_SIZE + 1)
+        subkeys = random.split(random_key, states.shape[0] + 1)
         random_key = subkeys[0]
         trajectories = jax.vmap(imagine_one_trajectory)(
-            states, subkeys[1:]
+            states, rnn_hidden_states, subkeys[1:]
         )  # IMAGINATION_HORIZON x BATCH_SIZE x SHAPE
 
+        def estimate_value(tau):
+            """Estimates the value of the given state."""
+
+            values = jnp.array([traj[4] for traj in trajectories[tau:]])
+            rewards = jnp.array([traj[3] for traj in trajectories[tau:]])
+
+            # return rewards.sum(axis=0)
+
+            def V_N(k):
+                V_N = 0.0
+                h = np.min([tau + k, 0 + IMAGINATION_HORIZON])
+                for n in range(tau, h):
+                    V_N += GAMMA ** (n - tau) * rewards[n - tau]
+                return V_N + (GAMMA ** (h - tau)) * values[h]
+
+            V_lambda = 0.0
+            for n in range(0, IMAGINATION_HORIZON):
+                V_lambda += (1 - LAMBDA) * (LAMBDA ** (n - 1) * V_N(n))
+            V_lambda += LAMBDA ** (IMAGINATION_HORIZON - 1) * V_N(IMAGINATION_HORIZON)
+
+            return V_lambda
+
         for t in range(IMAGINATION_HORIZON):
-            rewards = jnp.array([traj[3] for traj in trajectories[t:]])
-            values = rewards.sum(axis=0)
+            values = estimate_value(t)
             trajectories[t][5] = values
 
         values = jnp.array([traj[5] for traj in trajectories])
@@ -510,19 +534,19 @@ def dreamer():
     @jax.value_and_grad
     def value_loss_and_grad(params, trajectories):
         """Value Loss"""
+        states = jnp.array([traj[0] for traj in trajectories]).reshape(
+            IMAGINATION_HORIZON, -1, STATE_DIM
+        )
+        targets = jnp.array([traj[5] for traj in trajectories]).reshape(
+            IMAGINATION_HORIZON, -1, 1
+        )
+        values = value_nn.apply(params, states)
 
-        def trajectory_value_loss(states, targets):
-            values = value_nn.apply(params, states)
-            return 0.5 * jnp.power(values - targets, 2).mean()
+        loss = 0.5 * jnp.power(values - targets, 2).sum(axis=0).mean()
+        return loss
 
-        states = jnp.array([traj[0] for traj in trajectories]).reshape(-1, STATE_DIM)
-        targets = jnp.array([traj[5] for traj in trajectories]).reshape(-1, 1)
-
-        loss = jax.vmap(trajectory_value_loss)(states, targets)
-        return loss.mean()
-
-    env.reset()
-    current_observations = np.zeros(PIXEL_OBS_SHAPE[1:])
+    observations, _ = env.reset()
+    current_observations = observations["pixels"]
 
     # initial action
     on_policy_actions = np.array(env.action_space.sample())
@@ -571,7 +595,8 @@ def dreamer():
         current_observations = next_observations["pixels"]
 
         if dones or global_step % MAX_EPISODE_LENGTH == 0:
-            env.reset()
+            observations, _ = env.reset()
+            current_observations = observations["pixels"]
             on_policy_rnn_hidden_state = jnp.zeros((1, RNN_SIZE))
             on_policy_state = jnp.zeros((1, STATE_DIM))
             writer.add_scalar(
@@ -587,6 +612,7 @@ def dreamer():
         observations, actions, rewards, _ = rb.sample(BATCH_SIZE, CHUNK_LENGTH)
 
         observations = preprocess_obs(observations)
+
         # Adjust dimensions to match (chuck_size, batch_size, ...) pattern
         observations = jnp.transpose(observations, (1, 0, 2, 3, 4))
         actions = jnp.transpose(actions, (1, 0, 2))
@@ -643,7 +669,8 @@ def dreamer():
             trajectories,
         ), actor_grad = imagine_trajectories_with_value_grad(
             actor_params,
-            states[CHUNK_LENGTH - 1].reshape((-1, STATE_DIM)),
+            states.reshape((-1, STATE_DIM)),
+            rnn_hidden_states.reshape((-1, HIDDEN_DIM)),
             subkey,
         )
 
@@ -662,16 +689,17 @@ def dreamer():
         writer.add_scalar("loss/value", np.array(value_loss), global_step)
 
 
+@jax.jit
 def preprocess_obs(obs, bit_depth=6):
     """
     Reduces the bit depth of image for the ease of training
     and convert to [-0.5, 0.5]
     In addition, add uniform random noise same as original implementation
     """
-    obs = obs.astype(np.float16)
-    reduced_obs = np.floor(obs / 2 ** (8 - bit_depth))
+    obs = obs.astype(jnp.float16)
+    reduced_obs = jnp.floor(obs / 2 ** (8 - bit_depth))
     normalized_obs = reduced_obs / 2**bit_depth - 0.5
-    normalized_obs += np.random.uniform(0.0, 1.0 / 2**bit_depth, normalized_obs.shape)
+    # normalized_obs += np.random.uniform(0.0, 1.0 / 2**bit_depth, normalized_obs.shape)
     return normalized_obs
 
 
@@ -745,18 +773,6 @@ class ReplayBuffer(object):
             jnp.array(sampled_rewards),
             jnp.array(sampled_done),
         )
-
-    def retreive_last(self, chunk_length):
-        """Return last n entries from history"""
-
-        sampled_observations = self.observations[-chunk_length:].reshape(
-            1, chunk_length, *self.observations.shape[1:]
-        )
-        sampled_actions = self.actions[-chunk_length:].reshape(
-            1, chunk_length, self.actions.shape[1]
-        )
-
-        return sampled_observations, sampled_actions
 
     def __len__(self):
         return self.capacity if self.is_filled else self.index
