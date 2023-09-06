@@ -22,6 +22,7 @@ export XLA_PYTHON_CLIENT_PREALLOCATE=false
 ```
 
 ## Dreamer
+**not full implementation**
 
 A one-file mini implementation of [Dreamer (v1)](https://arxiv.org/pdf/1912.01603.pdf) algorithm in JAX.
 
